@@ -153,10 +153,7 @@ fn parse_long_listing_line(line: &str, show_hidden: bool) -> Option<Entry> {
     let permissions = parts[0];
     let is_dir = permissions.starts_with('d');
     let raw_name = parts[8];
-    let name = raw_name
-        .split_once(" -> ")
-        .map(|(name, _)| name)
-        .unwrap_or(raw_name);
+    let name = listing_name(raw_name);
     if name.is_empty() || name == "." || name == ".." {
         return None;
     }
@@ -170,6 +167,21 @@ fn parse_long_listing_line(line: &str, show_hidden: bool) -> Option<Entry> {
         size: (!is_dir).then_some(parse_human_size(parts[4])),
         modified: parse_ls_date(parts[5], parts[6], parts[7]),
     })
+}
+
+fn listing_name(raw_name: &str) -> String {
+    let name = raw_name
+        .split_once(" -> ")
+        .map(|(name, _)| name)
+        .unwrap_or(raw_name)
+        .trim();
+    let without_trailing_slash = name.trim_end_matches('/');
+    without_trailing_slash
+        .rsplit('/')
+        .next()
+        .filter(|leaf| !leaf.is_empty())
+        .unwrap_or(without_trailing_slash)
+        .to_string()
 }
 
 pub fn parent_remote_path(path: &str) -> String {
@@ -388,6 +400,26 @@ drwxr-xr-x  2 me staff  64 May 28 10:00 docs
         assert_eq!(entries[0].name, "docs");
         assert_eq!(entries[1].name, "report final.txt");
         assert_eq!(entries[1].size, Some(1536));
+    }
+
+    #[test]
+    fn parses_sftp_listing_with_absolute_names() {
+        let output = "\
+drwxr-xr-x    ? user group       4096 May 28 10:00 /remote/base/../
+drwxr-xr-x    ? user group       4096 May 28 10:00 /remote/base/./
+drwxr-xr-x    ? user group       4096 May 28 10:00 /remote/base/.cache/
+drwxr-xr-x    ? user group       4096 May 28 10:00 /remote/base/data/
+-rw-r--r--    ? user group        128 May 28 10:01 /remote/base/report.txt
+";
+        let entries = parse_ls_output(output, false, SortMode::Name);
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["data", "report.txt"]
+        );
     }
 
     #[test]

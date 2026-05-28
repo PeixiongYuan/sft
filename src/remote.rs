@@ -45,7 +45,7 @@ pub fn fetch_remote_listing(
     show_hidden: bool,
     sort: SortMode,
 ) -> Result<Vec<Entry>, String> {
-    let script = format!("ls -lah {}\n", sftp_quote(path));
+    let script = format!("cd {}\nls -lah\n", sftp_quote(path));
     let output = run_sftp_batch(connection, &script)?;
     Ok(browser::parse_ls_output(&output, show_hidden, sort))
 }
