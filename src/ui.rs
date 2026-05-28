@@ -5,7 +5,9 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, StatefulWidget, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, List, ListItem, Paragraph, StatefulWidget, Wrap,
+};
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
@@ -43,17 +45,10 @@ fn render_hosts(frame: &mut Frame, app: &mut App) {
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(
-                "sft",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  ssh config  "),
-            Span::styled(
-                app.ssh_config.path.display().to_string(),
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("sft", brand_style()),
+            Span::styled("  ssh file transfer", dim_style()),
+            Span::styled("  config ", label_style()),
+            Span::styled(app.ssh_config.path.display().to_string(), dim_style()),
         ])),
         rows[0],
     );
@@ -86,10 +81,7 @@ fn render_host_list(
     availability: &std::collections::HashMap<String, HostAvailability>,
     state: &mut ratatui::widgets::ListState,
 ) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" Hosts ({}) ", hosts.len()))
-        .border_style(Style::default().fg(Color::Cyan));
+    let block = panel_block(format!(" SSH Hosts  {} ", hosts.len()), true);
 
     if hosts.is_empty() {
         let lines = vec![
@@ -122,29 +114,24 @@ fn render_host_list(
             ListItem::new(Line::from(vec![
                 Span::styled(
                     pad_right(&truncate(&host.alias, alias_width), alias_width),
-                    Style::default().add_modifier(Modifier::BOLD),
+                    text_strong_style(),
                 ),
                 Span::raw("  "),
                 Span::styled(
                     pad_right(&truncate(&endpoint, endpoint_width), endpoint_width),
-                    Style::default().fg(Color::DarkGray),
+                    dim_style(),
                 ),
                 Span::raw(" "),
                 Span::styled(pad_right(status_text, status_width), status_style),
-                Span::styled(readonly.to_string(), Style::default().fg(Color::Yellow)),
+                Span::styled(readonly.to_string(), warning_style()),
             ]))
         })
         .collect::<Vec<_>>();
 
     let list = List::new(items)
         .block(block)
-        .highlight_symbol(">")
-        .highlight_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        );
+        .highlight_symbol("▌")
+        .highlight_style(selection_style());
     StatefulWidget::render(list, area, frame.buffer_mut(), state);
 }
 
@@ -155,10 +142,7 @@ fn render_host_sidebar(
     stats: &HostStats,
     availability: &std::collections::HashMap<String, HostAvailability>,
 ) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Details ")
-        .border_style(Style::default().fg(Color::DarkGray));
+    let block = panel_block(" Host Details ", false);
 
     let Some(host) = host else {
         frame.render_widget(Paragraph::new("No host selected.").block(block), area);
@@ -194,10 +178,7 @@ fn render_host_sidebar(
         let chart_lines = login_activity_chart(&stats.timestamps, chart_width, now_epoch());
         if !chart_lines.is_empty() {
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "Activity",
-                Style::default().fg(Color::DarkGray),
-            )));
+            lines.push(Line::from(Span::styled("Activity", label_style())));
             lines.extend(chart_lines);
         }
     }
@@ -228,7 +209,7 @@ fn render_host_footer(frame: &mut Frame, app: &App, area: Rect) {
         ]),
         Line::from(Span::styled(
             app.message.clone().unwrap_or_default(),
-            Style::default().fg(Color::DarkGray),
+            message_style(),
         )),
     ];
     frame.render_widget(Paragraph::new(lines), area);
@@ -253,7 +234,7 @@ fn render_password(frame: &mut Frame, app: &mut App) {
     let Some(prompt) = app.password_prompt.as_ref() else {
         return;
     };
-    let masked = "*".repeat(prompt.input.chars().count());
+    let masked = "•".repeat(prompt.input.chars().count());
     let action = if prompt.open_after_save {
         "open"
     } else {
@@ -269,16 +250,16 @@ fn render_password(frame: &mut Frame, app: &mut App) {
         Line::from(""),
         Line::from(vec![
             Span::raw("Host  "),
-            Span::styled(prompt.host.clone(), Style::default().fg(Color::Yellow)),
+            Span::styled(prompt.host.clone(), accent_warm_style()),
         ]),
         Line::from(vec![
             Span::raw(format!("{:<10}", "Password")),
-            Span::styled(masked, Style::default().fg(Color::Cyan)),
+            Span::styled(masked, accent_style()),
         ]),
         Line::from(""),
         Line::from(Span::styled(
             "Stored only for this sft process. Leave blank to use key/agent.",
-            Style::default().fg(Color::DarkGray),
+            dim_style(),
         )),
         Line::from(vec![
             key("Enter"),
@@ -290,10 +271,7 @@ fn render_password(frame: &mut Frame, app: &mut App) {
         ]),
     ];
 
-    frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Password ")),
-        rect,
-    );
+    frame.render_widget(Paragraph::new(lines).block(modal_block(" Password ")), rect);
 }
 
 fn render_path_prompt(frame: &mut Frame, app: &mut App) {
@@ -322,20 +300,20 @@ fn render_path_prompt(frame: &mut Frame, app: &mut App) {
         Line::from(""),
         Line::from(vec![
             Span::raw("Pane     "),
-            Span::styled(pane, Style::default().fg(Color::Yellow)),
+            Span::styled(pane, accent_warm_style()),
             Span::raw("  "),
-            Span::styled(completion_state, Style::default().fg(Color::DarkGray)),
+            Span::styled(completion_state, dim_style()),
         ]),
         Line::from(vec![
             Span::raw("Current  "),
             Span::styled(
                 truncate(&prompt.current, rect.width.saturating_sub(13) as usize),
-                Style::default().fg(Color::DarkGray),
+                dim_style(),
             ),
         ]),
         Line::from(vec![
             Span::raw("Path     "),
-            Span::styled(value.to_string(), Style::default().fg(Color::Cyan)),
+            Span::styled(value.to_string(), accent_style()),
         ]),
     ];
 
@@ -363,7 +341,7 @@ fn render_path_prompt(frame: &mut Frame, app: &mut App) {
                     .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::DarkGray)
+                dim_style()
             };
             lines.push(Line::from(vec![
                 Span::raw("       "),
@@ -388,10 +366,7 @@ fn render_path_prompt(frame: &mut Frame, app: &mut App) {
         Span::raw(" cancel"),
     ]));
 
-    frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Go To ")),
-        rect,
-    );
+    frame.render_widget(Paragraph::new(lines).block(modal_block(" Go To ")), rect);
 }
 
 fn render_search_prompt(frame: &mut Frame, app: &mut App) {
@@ -416,16 +391,13 @@ fn render_search_prompt(frame: &mut Frame, app: &mut App) {
         Line::from(""),
         Line::from(vec![
             Span::raw("Pane    "),
-            Span::styled(prompt.pane.label(), Style::default().fg(Color::Yellow)),
+            Span::styled(prompt.pane.label(), accent_warm_style()),
             Span::raw("  "),
-            Span::styled(
-                format!("{count} matches"),
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(format!("{count} matches"), dim_style()),
         ]),
         Line::from(vec![
             Span::raw("Find    "),
-            Span::styled(prompt.input.clone(), Style::default().fg(Color::Cyan)),
+            Span::styled(prompt.input.clone(), accent_style()),
         ]),
         Line::from(""),
         Line::from(vec![
@@ -438,10 +410,7 @@ fn render_search_prompt(frame: &mut Frame, app: &mut App) {
         ]),
     ];
 
-    frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Find ")),
-        rect,
-    );
+    frame.render_widget(Paragraph::new(lines).block(modal_block(" Find ")), rect);
 }
 
 fn render_path_list(frame: &mut Frame, app: &mut App) {
@@ -462,30 +431,21 @@ fn render_path_list(frame: &mut Frame, app: &mut App) {
             let mark = if entry.pinned { "*" } else { " " };
             let age = browser::format_relative_time(entry.last_used);
             ListItem::new(Line::from(vec![
-                Span::styled(format!(" {mark} "), Style::default().fg(Color::Yellow)),
+                Span::styled(format!(" {mark} "), accent_warm_style()),
                 Span::styled(
                     truncate(&entry.path, rect.width.saturating_sub(20) as usize),
-                    Style::default().fg(Color::White),
+                    text_style(),
                 ),
                 Span::raw(" "),
-                Span::styled(age, Style::default().fg(Color::DarkGray)),
+                Span::styled(age, dim_style()),
             ]))
         })
         .collect::<Vec<_>>();
 
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" {} Paths ", pane.label())),
-        )
-        .highlight_symbol(">")
-        .highlight_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        );
+        .block(modal_block(format!(" {} Paths ", pane.label())))
+        .highlight_symbol("▌")
+        .highlight_style(selection_style());
     StatefulWidget::render(list, rect, frame.buffer_mut(), &mut app.path_state);
 
     let help = Rect::new(
@@ -526,7 +486,7 @@ fn render_name_prompt(frame: &mut Frame, app: &mut App) {
         Line::from(""),
         Line::from(vec![
             Span::raw("Pane     "),
-            Span::styled(prompt.pane.label(), Style::default().fg(Color::Yellow)),
+            Span::styled(prompt.pane.label(), accent_warm_style()),
         ]),
     ];
     if !context.is_empty() {
@@ -534,13 +494,13 @@ fn render_name_prompt(frame: &mut Frame, app: &mut App) {
             Span::raw("Current  "),
             Span::styled(
                 truncate(&context, rect.width.saturating_sub(13) as usize),
-                Style::default().fg(Color::DarkGray),
+                dim_style(),
             ),
         ]));
     }
     lines.push(Line::from(vec![
         Span::raw(format!("{label:<9}")),
-        Span::styled(prompt.input.clone(), Style::default().fg(Color::Cyan)),
+        Span::styled(prompt.input.clone(), accent_style()),
     ]));
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
@@ -550,10 +510,7 @@ fn render_name_prompt(frame: &mut Frame, app: &mut App) {
         Span::raw(" cancel"),
     ]));
 
-    frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
-        rect,
-    );
+    frame.render_widget(Paragraph::new(lines).block(modal_block(title)), rect);
 }
 
 fn render_transfer_jobs(frame: &mut Frame, app: &mut App) {
@@ -587,9 +544,9 @@ fn render_transfer_jobs(frame: &mut Frame, app: &mut App) {
                 Line::from(vec![
                     Span::styled(format!("{:<7}", status), style),
                     Span::raw(" "),
-                    Span::styled(job.direction.label(), Style::default().fg(Color::Yellow)),
+                    Span::styled(job.direction.label(), accent_warm_style()),
                     Span::raw(format!("  {}  ", format_duration(duration))),
-                    Span::styled(job.host.clone(), Style::default().fg(Color::DarkGray)),
+                    Span::styled(job.host.clone(), dim_style()),
                 ]),
                 Line::from(vec![
                     Span::raw("  "),
@@ -603,7 +560,7 @@ fn render_transfer_jobs(frame: &mut Frame, app: &mut App) {
                     Span::raw("  "),
                     Span::styled(
                         truncate(&detail, rect.width.saturating_sub(8) as usize),
-                        Style::default().fg(Color::DarkGray),
+                        dim_style(),
                     ),
                 ]),
             ])
@@ -611,14 +568,9 @@ fn render_transfer_jobs(frame: &mut Frame, app: &mut App) {
         .collect::<Vec<_>>();
 
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(" Transfers "))
-        .highlight_symbol(">")
-        .highlight_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        );
+        .block(modal_block(" Transfers "))
+        .highlight_symbol("▌")
+        .highlight_style(selection_style());
     StatefulWidget::render(list, rect, frame.buffer_mut(), &mut app.transfer_state);
 
     let help = Rect::new(
@@ -661,19 +613,14 @@ fn render_form(frame: &mut Frame, app: &mut App) {
         let active = field == form.field;
         let marker = if active { ">" } else { " " };
         let style = if active {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
+            accent_strong_style()
         } else {
-            Style::default()
+            text_style()
         };
         lines.push(Line::from(vec![
             Span::styled(marker, style),
             Span::raw(" "),
-            Span::styled(
-                format!("{:<12}", field.label()),
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(format!("{:<12}", field.label()), label_style()),
             Span::styled(form.value(field).to_string(), style),
         ]));
     }
@@ -688,13 +635,10 @@ fn render_form(frame: &mut Frame, app: &mut App) {
     ]));
     lines.push(Line::from(Span::styled(
         app.message.clone().unwrap_or_default(),
-        Style::default().fg(Color::Yellow),
+        message_style(),
     )));
 
-    frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
-        rect,
-    );
+    frame.render_widget(Paragraph::new(lines).block(modal_block(title)), rect);
 }
 
 fn render_delete_confirm(frame: &mut Frame, app: &App, area: Rect) {
@@ -712,7 +656,7 @@ fn render_delete_confirm(frame: &mut Frame, app: &App, area: Rect) {
             Line::from(""),
             Line::from(vec![
                 Span::raw("Delete Host "),
-                Span::styled(selected.to_string(), Style::default().fg(Color::Yellow)),
+                Span::styled(selected.to_string(), accent_warm_style()),
                 Span::raw("?"),
             ]),
             Line::from(""),
@@ -723,7 +667,7 @@ fn render_delete_confirm(frame: &mut Frame, app: &App, area: Rect) {
                 Span::raw(" cancel"),
             ]),
         ])
-        .block(Block::default().borders(Borders::ALL).title(" Confirm ")),
+        .block(modal_block(" Confirm ")),
         rect,
     );
 }
@@ -741,7 +685,7 @@ fn render_files(frame: &mut Frame, app: &mut App) {
         .constraints([
             Constraint::Length(1),
             Constraint::Min(3),
-            Constraint::Length(2),
+            Constraint::Length(3),
         ])
         .split(area);
 
@@ -755,12 +699,17 @@ fn render_files(frame: &mut Frame, app: &mut App) {
     let local_entries = browser::filter_entries(&file.local_entries, &file.local_filter);
     let remote_entries = browser::filter_entries(&file.remote_entries, &file.remote_filter);
     let local_title = if file.local_filter.is_empty() {
-        format!(" Local {} ", file.local_path.display())
+        format!(
+            " Local  {}  {} items ",
+            file.local_path.display(),
+            local_entries.len()
+        )
     } else {
         format!(
-            " Local {}  filter:{} ",
+            " Local  {}  filter:{}  {} items ",
             file.local_path.display(),
-            file.local_filter
+            file.local_filter,
+            local_entries.len()
         )
     };
     render_pane(
@@ -776,11 +725,19 @@ fn render_files(frame: &mut Frame, app: &mut App) {
     );
 
     let remote_title = if file.remote_filter.is_empty() {
-        format!(" Remote {}:{} ", file.connection.host, file.remote_path)
+        format!(
+            " Remote  {}:{}  {} items ",
+            file.connection.host,
+            file.remote_path,
+            remote_entries.len()
+        )
     } else {
         format!(
-            " Remote {}:{}  filter:{} ",
-            file.connection.host, file.remote_path, file.remote_filter
+            " Remote  {}:{}  filter:{}  {} items ",
+            file.connection.host,
+            file.remote_path,
+            file.remote_filter,
+            remote_entries.len()
         )
     };
     render_pane(
@@ -813,19 +770,19 @@ fn render_files(frame: &mut Frame, app: &mut App) {
 fn render_file_header(frame: &mut Frame, file: &FileSession, area: Rect) {
     let active = format!("{} pane", file.active.label());
     let text = Line::from(vec![
+        Span::styled("sft", brand_style()),
+        Span::styled("  ", dim_style()),
+        Span::styled(file.connection.host.clone(), accent_style()),
+        Span::styled("  ", dim_style()),
+        Span::styled(active, accent_warm_style()),
         Span::styled(
-            "sft",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            format!(
+                "  sort:{}  hidden:{}",
+                file.sort.label(),
+                if file.show_hidden { "on" } else { "off" }
+            ),
+            dim_style(),
         ),
-        Span::raw(format!("  {}  ", file.connection.host)),
-        Span::styled(active, Style::default().fg(Color::Yellow)),
-        Span::raw(format!(
-            "  sort:{}  hidden:{}",
-            file.sort.label(),
-            if file.show_hidden { "on" } else { "off" }
-        )),
     ]);
     frame.render_widget(Paragraph::new(text), area);
 }
@@ -842,27 +799,25 @@ fn render_pane(
     active: bool,
     state: &mut ratatui::widgets::ListState,
 ) {
-    let border_style = if active {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(truncate(title, area.width.saturating_sub(4) as usize))
-        .border_style(border_style);
+    let block = panel_block(
+        truncate(title, area.width.saturating_sub(4) as usize),
+        active,
+    );
 
     if loading {
-        let paragraph = Paragraph::new("Loading remote directory ...")
-            .alignment(Alignment::Center)
-            .block(block);
+        let paragraph = Paragraph::new(Line::from(Span::styled(
+            "Loading remote directory ...",
+            dim_style(),
+        )))
+        .alignment(Alignment::Center)
+        .block(block);
         frame.render_widget(paragraph, area);
         return;
     }
 
     if let Some(error) = error {
         let paragraph = Paragraph::new(error.to_string())
-            .style(Style::default().fg(Color::Red))
+            .style(danger_style())
             .wrap(Wrap { trim: true })
             .block(block);
         frame.render_widget(paragraph, area);
@@ -872,13 +827,8 @@ fn render_pane(
     let items = file_items(entries, selected, area.width.saturating_sub(2) as usize);
     let list = List::new(items)
         .block(block)
-        .highlight_symbol(">")
-        .highlight_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        );
+        .highlight_symbol("▌")
+        .highlight_style(selection_style());
     StatefulWidget::render(list, area, frame.buffer_mut(), state);
 }
 
@@ -889,14 +839,14 @@ fn file_items<'a>(
 ) -> Vec<ListItem<'a>> {
     let mut items = Vec::with_capacity(entries.len() + 1);
     items.push(ListItem::new(Line::from(Span::styled(
-        "  ..",
-        Style::default().fg(Color::DarkGray),
+        "  ../",
+        dim_style(),
     ))));
 
     if entries.is_empty() {
         items.push(ListItem::new(Line::from(Span::styled(
             "  (empty)",
-            Style::default().fg(Color::DarkGray),
+            dim_style(),
         ))));
         return items;
     }
@@ -907,7 +857,7 @@ fn file_items<'a>(
 
     for entry in entries {
         let mark = if selected.contains(&entry.name) {
-            "*"
+            "●"
         } else {
             " "
         };
@@ -928,33 +878,26 @@ fn file_items<'a>(
             .unwrap_or_else(|| String::from(""));
 
         let name_style = if entry.is_dir {
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD)
+            accent_strong_style()
         } else if selected.contains(&entry.name) {
-            Style::default().fg(Color::Yellow)
+            accent_warm_style()
         } else {
-            Style::default()
+            text_style()
         };
 
         items.push(ListItem::new(Line::from(vec![
             Span::styled(
                 format!(" {mark} "),
                 if selected.contains(&entry.name) {
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
+                    accent_warm_style().add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default()
+                    dim_style()
                 },
             ),
             Span::styled(name, name_style),
             Span::raw(" ".repeat(name_padding)),
-            Span::styled(format!("{size:>9} "), Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{modified:>6} "),
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(format!("{size:>9} "), dim_style()),
+            Span::styled(format!("{modified:>6} "), dim_style()),
         ])));
     }
 
@@ -1009,12 +952,9 @@ fn render_file_footer(frame: &mut Frame, message: Option<&str>, file: &FileSessi
 
     let status = message.unwrap_or(if selected > 0 { "selection active" } else { "" });
     lines.push(Line::from(vec![
-        Span::styled(
-            format!("{} selected", selected),
-            Style::default().fg(Color::Yellow),
-        ),
+        Span::styled(format!("{} selected", selected), accent_warm_style()),
         Span::raw("  "),
-        Span::styled(status.to_string(), Style::default().fg(Color::DarkGray)),
+        Span::styled(status.to_string(), message_style()),
     ]));
 
     frame.render_widget(Paragraph::new(lines), area);
@@ -1033,12 +973,9 @@ fn render_copy_confirm(frame: &mut Frame, file: &FileSession, plan: &CopyPlan, a
     let mut lines = Vec::new();
     lines.push(Line::from(Span::styled(
         format!("Copy {} item(s) - {direction}", plan.names.len()),
-        Style::default().add_modifier(Modifier::BOLD),
+        text_strong_style(),
     )));
-    lines.push(Line::from(Span::styled(
-        destination,
-        Style::default().fg(Color::DarkGray),
-    )));
+    lines.push(Line::from(Span::styled(destination, dim_style())));
     lines.push(Line::from(""));
     for name in plan.names.iter().take(6) {
         lines.push(Line::from(format!("  {name}")));
@@ -1059,10 +996,7 @@ fn render_copy_confirm(frame: &mut Frame, file: &FileSession, plan: &CopyPlan, a
 
     let rect = centered_rect(area, 62, (lines.len() + 2) as u16);
     frame.render_widget(Clear, rect);
-    frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Confirm ")),
-        rect,
-    );
+    frame.render_widget(Paragraph::new(lines).block(modal_block(" Confirm ")), rect);
 }
 
 fn render_file_delete_confirm(frame: &mut Frame, plan: &DeletePlan, area: Rect) {
@@ -1073,12 +1007,12 @@ fn render_file_delete_confirm(frame: &mut Frame, plan: &DeletePlan, area: Rect) 
     let mut lines = Vec::new();
     lines.push(Line::from(Span::styled(
         format!("Delete {} {target} item(s)", plan.names.len()),
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        danger_style().add_modifier(Modifier::BOLD),
     )));
     if plan.has_dirs {
         lines.push(Line::from(Span::styled(
             "Includes directories; delete is recursive.",
-            Style::default().fg(Color::Yellow),
+            warning_style(),
         )));
     }
     lines.push(Line::from(""));
@@ -1101,10 +1035,7 @@ fn render_file_delete_confirm(frame: &mut Frame, plan: &DeletePlan, area: Rect) 
 
     let rect = centered_rect(area, 62, (lines.len() + 2) as u16);
     frame.render_widget(Clear, rect);
-    frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Delete ")),
-        rect,
-    );
+    frame.render_widget(Paragraph::new(lines).block(modal_block(" Delete ")), rect);
 }
 
 fn render_transfer(frame: &mut Frame, label: &str, job: Option<&TransferJob>, area: Rect) {
@@ -1114,7 +1045,7 @@ fn render_transfer(frame: &mut Frame, label: &str, job: Option<&TransferJob>, ar
         Line::from(""),
         Line::from(vec![
             Span::raw("  "),
-            Span::styled(label.to_string(), Style::default().fg(Color::Cyan)),
+            Span::styled(label.to_string(), accent_style()),
         ]),
     ];
     if let Some(job) = job {
@@ -1125,24 +1056,18 @@ fn render_transfer(frame: &mut Frame, label: &str, job: Option<&TransferJob>, ar
     } else {
         lines.push(Line::from(vec![
             Span::raw("  "),
-            Span::styled("starting...", Style::default().fg(Color::DarkGray)),
+            Span::styled("starting...", dim_style()),
         ]));
     }
     lines.push(Line::from(""));
 
-    frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Transfer ")),
-        rect,
-    );
+    frame.render_widget(Paragraph::new(lines).block(modal_block(" Transfer ")), rect);
 }
 
 fn transfer_progress_line(job: &TransferJob, width: usize) -> Line<'static> {
     Line::from(vec![
         Span::raw("  "),
-        Span::styled(
-            truncate(&transfer_progress_text(job), width),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(truncate(&transfer_progress_text(job), width), dim_style()),
     ])
 }
 
@@ -1195,9 +1120,9 @@ fn format_transfer_speed(speed_bps: Option<u64>) -> String {
 
 fn transfer_status(status: TransferJobStatus) -> (&'static str, Style) {
     match status {
-        TransferJobStatus::Running => ("running", Style::default().fg(Color::Cyan)),
-        TransferJobStatus::Succeeded => ("done", Style::default().fg(Color::Green)),
-        TransferJobStatus::Failed => ("failed", Style::default().fg(Color::Red)),
+        TransferJobStatus::Running => ("running", accent_style()),
+        TransferJobStatus::Succeeded => ("done", success_style()),
+        TransferJobStatus::Failed => ("failed", danger_style()),
     }
 }
 
@@ -1234,18 +1159,18 @@ fn format_endpoint(host: &HostEntry) -> String {
 
 fn detail_line(label: &'static str, value: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{label:<9}"), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{label:<9}"), label_style()),
         Span::raw(value.to_string()),
     ])
 }
 
 fn availability_marker(status: HostAvailability) -> (&'static str, Style) {
     match status {
-        HostAvailability::Unknown => ("○", Style::default().fg(Color::DarkGray)),
-        HostAvailability::Checking => ("...", Style::default().fg(Color::Yellow)),
-        HostAvailability::Reachable { .. } => ("●", Style::default().fg(Color::Green)),
-        HostAvailability::Slow { .. } => ("▲", Style::default().fg(Color::Yellow)),
-        HostAvailability::Unreachable => ("✖", Style::default().fg(Color::Red)),
+        HostAvailability::Unknown => ("○", dim_style()),
+        HostAvailability::Checking => ("…", warning_style()),
+        HostAvailability::Reachable { .. } => ("●", success_style()),
+        HostAvailability::Slow { .. } => ("▲", warning_style()),
+        HostAvailability::Unreachable => ("✕", danger_style()),
     }
 }
 
@@ -1337,35 +1262,22 @@ fn login_activity_chart(timestamps: &[i64], chart_width: usize, now: i64) -> Vec
             if !filled_run.is_empty() {
                 spans.push(Span::styled(
                     std::mem::take(&mut filled_run),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
+                    accent_strong_style(),
                 ));
             }
             empty_run.push('·');
         } else {
             if !empty_run.is_empty() {
-                spans.push(Span::styled(
-                    std::mem::take(&mut empty_run),
-                    Style::default().fg(Color::DarkGray),
-                ));
+                spans.push(Span::styled(std::mem::take(&mut empty_run), dim_style()));
             }
             filled_run.push(ACTIVITY_BLOCKS[height.min(8)]);
         }
     }
     if !filled_run.is_empty() {
-        spans.push(Span::styled(
-            filled_run,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
+        spans.push(Span::styled(filled_run, accent_strong_style()));
     }
     if !empty_run.is_empty() {
-        spans.push(Span::styled(
-            empty_run,
-            Style::default().fg(Color::DarkGray),
-        ));
+        spans.push(Span::styled(empty_run, dim_style()));
     }
 
     vec![Line::from(spans), activity_axis(chart_width, chart_days)]
@@ -1384,18 +1296,18 @@ fn activity_axis(chart_width: usize, chart_days: i64) -> Line<'static> {
         let left_gap = total_gap / 2;
         let right_gap = total_gap - left_gap;
         Line::from(vec![
-            Span::styled(left, Style::default().fg(Color::DarkGray)),
+            Span::styled(left, dim_style()),
             Span::raw(" ".repeat(left_gap)),
-            Span::styled(middle, Style::default().fg(Color::DarkGray)),
+            Span::styled(middle, dim_style()),
             Span::raw(" ".repeat(right_gap)),
-            Span::styled(right.to_string(), Style::default().fg(Color::DarkGray)),
+            Span::styled(right.to_string(), dim_style()),
         ])
     } else {
         let gap = chart_width.saturating_sub(left.len() + right.len());
         Line::from(vec![
-            Span::styled(left, Style::default().fg(Color::DarkGray)),
+            Span::styled(left, dim_style()),
             Span::raw(" ".repeat(gap)),
-            Span::styled(right.to_string(), Style::default().fg(Color::DarkGray)),
+            Span::styled(right.to_string(), dim_style()),
         ])
     }
 }
@@ -1415,13 +1327,82 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     Rect::new(x, y, width, height)
 }
 
+fn panel_block(title: impl Into<String>, active: bool) -> Block<'static> {
+    let border_style = if active { accent_style() } else { dim_style() };
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(Span::styled(title.into(), label_style()))
+        .border_style(border_style)
+}
+
+fn modal_block(title: impl Into<String>) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(Span::styled(title.into(), label_style()))
+        .border_style(accent_style())
+}
+
+fn brand_style() -> Style {
+    Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn accent_style() -> Style {
+    Style::default().fg(Color::Cyan)
+}
+
+fn accent_strong_style() -> Style {
+    accent_style().add_modifier(Modifier::BOLD)
+}
+
+fn accent_warm_style() -> Style {
+    Style::default().fg(Color::Yellow)
+}
+
+fn text_style() -> Style {
+    Style::default()
+}
+
+fn text_strong_style() -> Style {
+    text_style().add_modifier(Modifier::BOLD)
+}
+
+fn dim_style() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+
+fn label_style() -> Style {
+    dim_style().add_modifier(Modifier::BOLD)
+}
+
+fn message_style() -> Style {
+    Style::default().fg(Color::Gray)
+}
+
+fn warning_style() -> Style {
+    Style::default().fg(Color::Yellow)
+}
+
+fn success_style() -> Style {
+    Style::default().fg(Color::Green)
+}
+
+fn danger_style() -> Style {
+    Style::default().fg(Color::Red)
+}
+
+fn selection_style() -> Style {
+    Style::default()
+        .fg(Color::Black)
+        .bg(Color::Cyan)
+        .add_modifier(Modifier::BOLD)
+}
+
 fn key(value: &'static str) -> Span<'static> {
-    Span::styled(
-        value,
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )
+    Span::styled(value, accent_strong_style())
 }
 
 fn pad_right(value: &str, width: usize) -> String {
