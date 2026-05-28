@@ -20,12 +20,9 @@ cargo install --path .
 
 ```sh
 sft
-sft my-server
-sft user@example.com --local ~/Downloads --remote /var/tmp
-sft -F ~/.ssh/config workbox
 ```
 
-Run `sft` without a host to open the host picker from `~/.ssh/config`.
+Run `sft` to open the host picker from `~/.ssh/config`.
 
 The host picker shows a status marker on each row: a green circle means the SSH TCP endpoint is reachable, a yellow triangle means it is slow, and a red `x` means it is unreachable. This check does not attempt SSH authentication or ask for a password. The right sidebar shows the selected host's basic SSH fields, local usage stats, and a small login activity bar plot.
 
@@ -95,3 +92,7 @@ cargo fmt
 cargo test
 cargo clippy --all-targets -- -D warnings
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
