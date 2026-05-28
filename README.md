@@ -60,6 +60,11 @@ File transfer:
 | `r` | Refresh both panes |
 | `g` | Jump to a local or remote directory; `Tab` completes directories |
 | `f` | Search/filter the active pane as you type |
+| `n` | Create a directory in the active pane |
+| `e` | Rename the selected item |
+| `x`, `D` | Delete selected items or the current item after confirmation |
+| `b` | Bookmark or unbookmark the active path |
+| `B`, `o` | Open bookmarked/recent paths for the active pane |
 | `p` | Set or replace the session password for this host |
 | `q`, `Esc` | Quit |
 
@@ -73,6 +78,7 @@ File transfer:
 - Wildcard and multi-alias `Host` blocks can be opened when concrete aliases are present, but are treated as read-only for safety.
 - Directory copies use `scp -r`.
 - Transfers may overwrite existing destination files, so `sft` always asks for confirmation.
+- Delete operations are recursive for directories and always ask for confirmation.
 
 ## Development
 

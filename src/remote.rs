@@ -128,6 +128,48 @@ pub fn run_scp(connection: &Connection, args: &[String]) -> Result<(), String> {
     }
 }
 
+pub fn create_remote_dir(connection: &Connection, path: &str, name: &str) -> Result<(), String> {
+    let target = browser::join_remote_path(path, name);
+    run_remote_shell(
+        connection,
+        &format!("mkdir -p -- {}", browser::shell_escape(&target)),
+    )
+}
+
+pub fn rename_remote_entry(
+    connection: &Connection,
+    path: &str,
+    old_name: &str,
+    new_name: &str,
+) -> Result<(), String> {
+    let source = browser::join_remote_path(path, old_name);
+    let target = browser::join_remote_path(path, new_name);
+    let source = browser::shell_escape(&source);
+    let target = browser::shell_escape(&target);
+    run_remote_shell(
+        connection,
+        &format!(
+            "if [ -e {target} ]; then printf '%s\\n' 'target already exists' >&2; exit 1; fi; mv -- {source} {target}"
+        ),
+    )
+}
+
+pub fn delete_remote_entries(
+    connection: &Connection,
+    path: &str,
+    names: &[String],
+) -> Result<(), String> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    let targets = names
+        .iter()
+        .map(|name| browser::shell_escape(&browser::join_remote_path(path, name)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    run_remote_shell(connection, &format!("rm -rf -- {targets}"))
+}
+
 pub fn check_reachability(host: &str, config_path: Option<&Path>) -> Option<u32> {
     let target = resolve_tcp_check_target(host, config_path);
     tcp_connect_rtt(&target.hostname, target.port)
@@ -163,6 +205,22 @@ pub fn resolve_tcp_check_target(host: &str, config_path: Option<&Path>) -> TcpCh
         hostname,
         port,
         via_proxy_jump: Some(jump.host),
+    }
+}
+
+fn run_remote_shell(connection: &Connection, remote_command: &str) -> Result<(), String> {
+    let output = ssh_command(connection, remote_command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|err| format!("failed to spawn ssh: {err}"))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(useful_error(&stderr, output.status.code()))
     }
 }
 

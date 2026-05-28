@@ -8,7 +8,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, StatefulWidget, Wrap};
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, CopyPlan, FileSession, HostAvailability, HostField, HostFormMode, Screen};
+use crate::app::{
+    App, CopyPlan, DeletePlan, FileSession, HostAvailability, HostField, HostFormMode,
+    NamePromptKind, Screen,
+};
 use crate::browser::{self, Entry, Pane};
 use crate::history::{HostStats, format_last_opened};
 use crate::ssh_config::HostEntry;
@@ -22,6 +25,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Screen::PathPrompt => render_path_prompt(frame, app),
         Screen::SearchPrompt => render_search_prompt(frame, app),
         Screen::PathList => render_path_list(frame, app),
+        Screen::NamePrompt => render_name_prompt(frame, app),
     }
 }
 
@@ -32,7 +36,7 @@ fn render_hosts(frame: &mut Frame, app: &mut App) {
         .constraints([
             Constraint::Length(1),
             Constraint::Min(3),
-            Constraint::Length(2),
+            Constraint::Length(3),
         ])
         .split(area);
 
@@ -502,6 +506,55 @@ fn render_path_list(frame: &mut Frame, app: &mut App) {
     );
 }
 
+fn render_name_prompt(frame: &mut Frame, app: &mut App) {
+    render_files(frame, app);
+
+    let area = frame.area();
+    let rect = centered_rect(area, 62, 8);
+    frame.render_widget(Clear, rect);
+
+    let Some(prompt) = app.name_prompt.as_ref() else {
+        return;
+    };
+    let (title, label, context) = match &prompt.kind {
+        NamePromptKind::Mkdir => (" New Directory ", "Name", String::new()),
+        NamePromptKind::Rename { old_name } => (" Rename ", "New name", old_name.clone()),
+    };
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("Pane     "),
+            Span::styled(prompt.pane.label(), Style::default().fg(Color::Yellow)),
+        ]),
+    ];
+    if !context.is_empty() {
+        lines.push(Line::from(vec![
+            Span::raw("Current  "),
+            Span::styled(
+                truncate(&context, rect.width.saturating_sub(13) as usize),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+    lines.push(Line::from(vec![
+        Span::raw(format!("{label:<9}")),
+        Span::styled(prompt.input.clone(), Style::default().fg(Color::Cyan)),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        key("Enter"),
+        Span::raw(" apply  "),
+        key("Esc"),
+        Span::raw(" cancel"),
+    ]));
+
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
+        rect,
+    );
+}
+
 fn render_form(frame: &mut Frame, app: &mut App) {
     render_hosts(frame, app);
 
@@ -660,6 +713,10 @@ fn render_files(frame: &mut Frame, app: &mut App) {
 
     if let Some(plan) = file.confirm.as_ref() {
         render_copy_confirm(frame, file, plan, area);
+    }
+
+    if let Some(plan) = file.delete_confirm.as_ref() {
+        render_file_delete_confirm(frame, plan, area);
     }
 
     if let Some(label) = file.transferring.as_deref() {
@@ -823,34 +880,44 @@ fn render_file_footer(frame: &mut Frame, message: Option<&str>, file: &FileSessi
         Pane::Local => file.local_selected.len(),
         Pane::Remote => file.remote_selected.len(),
     };
-    let mut lines = vec![Line::from(vec![
-        key("Enter"),
-        Span::raw(" open/copy  "),
-        key("Tab"),
-        Span::raw(" switch  "),
-        key("^Space"),
-        Span::raw(" select  "),
-        key("^A"),
-        Span::raw(" all  "),
-        key("."),
-        Span::raw(" hidden  "),
-        key("s"),
-        Span::raw(" sort  "),
-        key("r"),
-        Span::raw(" refresh  "),
-        key("g"),
-        Span::raw(" goto  "),
-        key("f"),
-        Span::raw(" find  "),
-        key("b"),
-        Span::raw(" mark  "),
-        key("B/o"),
-        Span::raw(" paths  "),
-        key("p"),
-        Span::raw(" password  "),
-        key("q"),
-        Span::raw(" back/quit"),
-    ])];
+    let mut lines = vec![
+        Line::from(vec![
+            key("Enter"),
+            Span::raw(" open/copy  "),
+            key("Tab"),
+            Span::raw(" switch  "),
+            key("^Space"),
+            Span::raw(" select  "),
+            key("^A"),
+            Span::raw(" all  "),
+            key("."),
+            Span::raw(" hidden  "),
+            key("s"),
+            Span::raw(" sort  "),
+            key("r"),
+            Span::raw(" refresh  "),
+        ]),
+        Line::from(vec![
+            key("g"),
+            Span::raw(" goto  "),
+            key("f"),
+            Span::raw(" find  "),
+            key("n"),
+            Span::raw(" mkdir  "),
+            key("e"),
+            Span::raw(" rename  "),
+            key("x"),
+            Span::raw(" delete  "),
+            key("b"),
+            Span::raw(" mark  "),
+            key("B/o"),
+            Span::raw(" paths  "),
+            key("p"),
+            Span::raw(" password  "),
+            key("q"),
+            Span::raw(" back/quit"),
+        ]),
+    ];
 
     let status = message.unwrap_or(if selected > 0 { "selection active" } else { "" });
     lines.push(Line::from(vec![
@@ -906,6 +973,48 @@ fn render_copy_confirm(frame: &mut Frame, file: &FileSession, plan: &CopyPlan, a
     frame.render_widget(Clear, rect);
     frame.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Confirm ")),
+        rect,
+    );
+}
+
+fn render_file_delete_confirm(frame: &mut Frame, plan: &DeletePlan, area: Rect) {
+    let target = match plan.pane {
+        Pane::Local => "local",
+        Pane::Remote => "remote",
+    };
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        format!("Delete {} {target} item(s)", plan.names.len()),
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+    )));
+    if plan.has_dirs {
+        lines.push(Line::from(Span::styled(
+            "Includes directories; delete is recursive.",
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    lines.push(Line::from(""));
+    for name in plan.names.iter().take(6) {
+        lines.push(Line::from(format!("  {name}")));
+    }
+    if plan.names.len() > 6 {
+        lines.push(Line::from(format!(
+            "  ... and {} more",
+            plan.names.len() - 6
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        key("y/Enter"),
+        Span::raw(" delete  "),
+        key("n/Esc"),
+        Span::raw(" cancel"),
+    ]));
+
+    let rect = centered_rect(area, 62, (lines.len() + 2) as u16);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Delete ")),
         rect,
     );
 }

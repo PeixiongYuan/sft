@@ -38,6 +38,10 @@ pub enum AppEvent {
     TransferFinished {
         result: Result<(), String>,
     },
+    FileOperationFinished {
+        operation: FileOperation,
+        result: Result<String, String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +73,24 @@ pub enum Screen {
     PathPrompt,
     SearchPrompt,
     PathList,
+    NamePrompt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileOperation {
+    Mkdir,
+    Rename,
+    Delete,
+}
+
+impl FileOperation {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Mkdir => "create directory",
+            Self::Rename => "rename",
+            Self::Delete => "delete",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +177,26 @@ pub struct SearchPrompt {
     pub previous: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct NamePrompt {
+    pub pane: Pane,
+    pub kind: NamePromptKind,
+    pub input: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum NamePromptKind {
+    Mkdir,
+    Rename { old_name: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct DeletePlan {
+    pub pane: Pane,
+    pub names: Vec<String>,
+    pub has_dirs: bool,
+}
+
 impl HostForm {
     fn add() -> Self {
         Self {
@@ -223,6 +265,7 @@ pub struct FileSession {
     pub remote_error: Option<String>,
     pub remote_loading: bool,
     pub confirm: Option<CopyPlan>,
+    pub delete_confirm: Option<DeletePlan>,
     pub transferring: Option<String>,
 }
 
@@ -259,6 +302,7 @@ impl FileSession {
             remote_error: None,
             remote_loading: true,
             confirm: None,
+            delete_confirm: None,
             transferring: None,
         };
         session
@@ -358,6 +402,7 @@ pub struct App {
     pub password_prompt: Option<PasswordPrompt>,
     pub path_prompt: Option<PathPrompt>,
     pub search_prompt: Option<SearchPrompt>,
+    pub name_prompt: Option<NamePrompt>,
     pub file: Option<FileSession>,
     pub passwords: HashMap<String, PasswordHandle>,
     pub local_start: PathBuf,
@@ -395,6 +440,7 @@ impl App {
             password_prompt: None,
             path_prompt: None,
             search_prompt: None,
+            name_prompt: None,
             file: None,
             passwords: HashMap::new(),
             local_start: local_path,
@@ -430,6 +476,7 @@ impl App {
             Screen::PathPrompt => self.handle_path_prompt_key(key, tx),
             Screen::SearchPrompt => self.handle_search_prompt_key(key),
             Screen::PathList => self.handle_path_list_key(key, tx),
+            Screen::NamePrompt => self.handle_name_prompt_key(key, tx),
         }
     }
 
@@ -524,6 +571,29 @@ impl App {
                     self.message = Some(format!("authentication required for {host}"));
                 }
             }
+            AppEvent::FileOperationFinished { operation, result } => {
+                let mut auth_prompt_host = None;
+                if let Some(file) = self.file.as_mut() {
+                    file.transferring = None;
+                }
+                match result {
+                    Ok(message) => {
+                        self.refresh_file_panes(tx)?;
+                        self.message = Some(message);
+                    }
+                    Err(err) => {
+                        if is_auth_error(&err) {
+                            auth_prompt_host =
+                                self.file.as_ref().map(|file| file.connection.host.clone());
+                        }
+                        self.message = Some(format!("{} failed: {err}", operation.label()));
+                    }
+                }
+                if let Some(host) = auth_prompt_host {
+                    self.prompt_for_host_password(host.clone(), Screen::Files, false);
+                    self.message = Some(format!("authentication required for {host}"));
+                }
+            }
         }
         Ok(())
     }
@@ -572,6 +642,15 @@ impl App {
     }
 
     fn handle_files_key(&mut self, key: KeyEvent, tx: Sender<AppEvent>) -> Result<()> {
+        if self
+            .file
+            .as_ref()
+            .is_some_and(|file| file.delete_confirm.is_some())
+        {
+            self.handle_delete_confirm_key(key, tx);
+            return Ok(());
+        }
+
         if self
             .file
             .as_ref()
@@ -653,6 +732,9 @@ impl App {
             KeyCode::Char('f') => {
                 self.start_search_prompt();
             }
+            KeyCode::Char('n') => self.start_mkdir_prompt(),
+            KeyCode::Char('e') => self.start_rename_prompt(),
+            KeyCode::Char('x') | KeyCode::Char('D') => self.start_delete_confirm(),
             KeyCode::Char('b') => self.toggle_current_path_bookmark(),
             KeyCode::Char('B') | KeyCode::Char('o') => self.start_path_list(),
             _ => {}
@@ -972,6 +1054,73 @@ impl App {
         Ok(())
     }
 
+    fn handle_name_prompt_key(&mut self, key: KeyEvent, tx: Sender<AppEvent>) -> Result<()> {
+        if self.name_prompt.is_none() {
+            self.screen = Screen::Files;
+            return Ok(());
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.name_prompt = None;
+                self.screen = Screen::Files;
+                self.message = None;
+            }
+            KeyCode::Enter => {
+                let Some(prompt) = self.name_prompt.clone() else {
+                    return Ok(());
+                };
+                let name = match validate_entry_name(&prompt.input) {
+                    Ok(name) => name,
+                    Err(err) => {
+                        self.message = Some(err);
+                        return Ok(());
+                    }
+                };
+
+                let result = match prompt.kind {
+                    NamePromptKind::Mkdir => self.start_mkdir(prompt.pane, name, tx),
+                    NamePromptKind::Rename { old_name } => {
+                        if old_name == name {
+                            self.name_prompt = None;
+                            self.screen = Screen::Files;
+                            self.message = Some("name unchanged".to_string());
+                            return Ok(());
+                        }
+                        self.start_rename(prompt.pane, old_name, name, tx)
+                    }
+                };
+
+                match result {
+                    Ok(()) => {
+                        self.name_prompt = None;
+                        self.screen = Screen::Files;
+                    }
+                    Err(err) => self.message = Some(err),
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(prompt) = self.name_prompt.as_mut() {
+                    prompt.input.pop();
+                }
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(prompt) = self.name_prompt.as_mut() {
+                    prompt.input.clear();
+                }
+            }
+            KeyCode::Char(c)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                if let Some(prompt) = self.name_prompt.as_mut() {
+                    prompt.input.push(c);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn save_form(&mut self) {
         let Some(form) = self.form.clone() else {
             self.screen = Screen::Hosts;
@@ -1039,7 +1188,8 @@ impl App {
             | Screen::PasswordPrompt
             | Screen::PathPrompt
             | Screen::SearchPrompt
-            | Screen::PathList => None,
+            | Screen::PathList
+            | Screen::NamePrompt => None,
         };
         let Some(host) = host else {
             return;
@@ -1325,6 +1475,157 @@ impl App {
         Some((file.connection.host.clone(), pane, path))
     }
 
+    fn start_mkdir_prompt(&mut self) {
+        let Some(file) = self.file.as_ref() else {
+            return;
+        };
+        if file.active == Pane::Remote && (file.remote_loading || file.remote_error.is_some()) {
+            return;
+        }
+        self.name_prompt = Some(NamePrompt {
+            pane: file.active,
+            kind: NamePromptKind::Mkdir,
+            input: String::new(),
+        });
+        self.screen = Screen::NamePrompt;
+        self.message = None;
+    }
+
+    fn start_rename_prompt(&mut self) {
+        let Some((pane, name)) = self.current_entry_name() else {
+            return;
+        };
+        self.name_prompt = Some(NamePrompt {
+            pane,
+            kind: NamePromptKind::Rename {
+                old_name: name.clone(),
+            },
+            input: name,
+        });
+        self.screen = Screen::NamePrompt;
+        self.message = None;
+    }
+
+    fn start_delete_confirm(&mut self) {
+        let Some(file) = self.file.as_mut() else {
+            return;
+        };
+        if file.active == Pane::Remote && (file.remote_loading || file.remote_error.is_some()) {
+            return;
+        }
+        let Some(plan) = delete_plan_from_selection_or_current(file) else {
+            return;
+        };
+        file.delete_confirm = Some(plan);
+        self.message = None;
+    }
+
+    fn start_mkdir(
+        &mut self,
+        pane: Pane,
+        name: String,
+        tx: Sender<AppEvent>,
+    ) -> Result<(), String> {
+        let Some(file) = self.file.as_mut() else {
+            return Ok(());
+        };
+        match pane {
+            Pane::Local => {
+                let target = file.local_path.join(&name);
+                if target.exists() {
+                    return Err(format!("target already exists: {name}"));
+                }
+                std::fs::create_dir_all(&target)
+                    .map_err(|err| format!("could not create local directory: {err}"))?;
+                self.refresh_file_panes(tx).map_err(|err| err.to_string())?;
+                self.message = Some(format!("created local directory {name}"));
+            }
+            Pane::Remote => {
+                let connection = file.connection.clone();
+                let path = file.remote_path.clone();
+                file.transferring = Some(format!("creating directory {name}"));
+                thread::spawn(move || {
+                    let result = remote::create_remote_dir(&connection, &path, &name)
+                        .map(|()| format!("created remote directory {name}"));
+                    let _ = tx.send(AppEvent::FileOperationFinished {
+                        operation: FileOperation::Mkdir,
+                        result,
+                    });
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn start_rename(
+        &mut self,
+        pane: Pane,
+        old_name: String,
+        new_name: String,
+        tx: Sender<AppEvent>,
+    ) -> Result<(), String> {
+        let Some(file) = self.file.as_mut() else {
+            return Ok(());
+        };
+        match pane {
+            Pane::Local => {
+                let source = file.local_path.join(&old_name);
+                let target = file.local_path.join(&new_name);
+                if target.exists() {
+                    return Err(format!("target already exists: {new_name}"));
+                }
+                std::fs::rename(&source, &target)
+                    .map_err(|err| format!("could not rename local entry: {err}"))?;
+                self.refresh_file_panes(tx).map_err(|err| err.to_string())?;
+                self.message = Some(format!("renamed {old_name} to {new_name}"));
+            }
+            Pane::Remote => {
+                let connection = file.connection.clone();
+                let path = file.remote_path.clone();
+                file.transferring = Some(format!("renaming {old_name}"));
+                thread::spawn(move || {
+                    let result =
+                        remote::rename_remote_entry(&connection, &path, &old_name, &new_name)
+                            .map(|()| format!("renamed {old_name} to {new_name}"));
+                    let _ = tx.send(AppEvent::FileOperationFinished {
+                        operation: FileOperation::Rename,
+                        result,
+                    });
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn start_delete(&mut self, plan: DeletePlan, tx: Sender<AppEvent>) -> Result<(), String> {
+        let Some(file) = self.file.as_mut() else {
+            return Ok(());
+        };
+        match plan.pane {
+            Pane::Local => {
+                delete_local_entries(&file.local_path, &plan.names)?;
+                self.refresh_file_panes(tx).map_err(|err| err.to_string())?;
+                self.message = Some(format!("deleted {} local item(s)", plan.names.len()));
+            }
+            Pane::Remote => {
+                let connection = file.connection.clone();
+                let path = file.remote_path.clone();
+                let count = plan.names.len();
+                let names = plan.names;
+                file.transferring = Some(format!("deleting {count} item(s)"));
+                thread::spawn(move || {
+                    let result = remote::delete_remote_entries(&connection, &path, &names)
+                        .map(|()| format!("deleted {count} remote item(s)"));
+                    let _ = tx.send(AppEvent::FileOperationFinished {
+                        operation: FileOperation::Delete,
+                        result,
+                    });
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn handle_confirm_key(&mut self, key: KeyEvent, tx: Sender<AppEvent>) {
         match key.code {
             KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
@@ -1336,6 +1637,28 @@ impl App {
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
                 if let Some(file) = self.file.as_mut() {
                     file.confirm = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_delete_confirm_key(&mut self, key: KeyEvent, tx: Sender<AppEvent>) {
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let plan = self
+                    .file
+                    .as_mut()
+                    .and_then(|file| file.delete_confirm.take());
+                if let Some(plan) = plan
+                    && let Err(err) = self.start_delete(plan, tx)
+                {
+                    self.message = Some(err);
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                if let Some(file) = self.file.as_mut() {
+                    file.delete_confirm = None;
                 }
             }
             _ => {}
@@ -1502,6 +1825,26 @@ impl App {
         }
     }
 
+    fn current_entry_name(&self) -> Option<(Pane, String)> {
+        let file = self.file.as_ref()?;
+        if file.active == Pane::Remote && (file.remote_loading || file.remote_error.is_some()) {
+            return None;
+        }
+        let idx = file.selected_index();
+        if idx == 0 {
+            return None;
+        }
+        let name = match file.active {
+            Pane::Local => browser::filter_entries(&file.local_entries, &file.local_filter)
+                .get(idx - 1)
+                .map(|entry| entry.name.clone()),
+            Pane::Remote => browser::filter_entries(&file.remote_entries, &file.remote_filter)
+                .get(idx - 1)
+                .map(|entry| entry.name.clone()),
+        }?;
+        Some((file.active, name))
+    }
+
     fn move_file_selection(&mut self, delta: isize) {
         let Some(file) = self.file.as_mut() else {
             return;
@@ -1584,6 +1927,75 @@ fn copy_plan_from_selection(file: &FileSession) -> Option<CopyPlan> {
         names,
         has_dirs,
     })
+}
+
+fn delete_plan_from_selection_or_current(file: &FileSession) -> Option<DeletePlan> {
+    let (selected, all_entries, filter) = match file.active {
+        Pane::Local => (
+            &file.local_selected,
+            &file.local_entries,
+            &file.local_filter,
+        ),
+        Pane::Remote => (
+            &file.remote_selected,
+            &file.remote_entries,
+            &file.remote_filter,
+        ),
+    };
+
+    let names = if selected.is_empty() {
+        let idx = file.selected_index();
+        if idx == 0 {
+            return None;
+        }
+        let entries = browser::filter_entries(all_entries, filter);
+        vec![entries.get(idx - 1)?.name.clone()]
+    } else {
+        let mut names = selected.iter().cloned().collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    let has_dirs = names.iter().any(|name| {
+        all_entries
+            .iter()
+            .any(|entry| entry.name == *name && entry.is_dir)
+    });
+
+    Some(DeletePlan {
+        pane: file.active,
+        names,
+        has_dirs,
+    })
+}
+
+fn delete_local_entries(base: &Path, names: &[String]) -> Result<(), String> {
+    for name in names {
+        let path = base.join(name);
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|err| format!("could not inspect {}: {err}", path.display()))?;
+        if metadata.file_type().is_dir() {
+            std::fs::remove_dir_all(&path)
+                .map_err(|err| format!("could not delete {}: {err}", path.display()))?;
+        } else {
+            std::fs::remove_file(&path)
+                .map_err(|err| format!("could not delete {}: {err}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_entry_name(input: &str) -> Result<String, String> {
+    let name = input.trim();
+    if name.is_empty() {
+        return Err("name is required".to_string());
+    }
+    if name == "." || name == ".." {
+        return Err("name cannot be . or ..".to_string());
+    }
+    if name.contains('/') || name.contains('\0') {
+        return Err("name cannot contain /".to_string());
+    }
+    Ok(name.to_string())
 }
 
 fn resolve_local_jump_path(current: &Path, input: &str) -> Result<PathBuf, String> {
@@ -1843,5 +2255,13 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(completion_from_names("", "stor", &names).is_none());
+    }
+
+    #[test]
+    fn entry_names_reject_path_separators() {
+        assert_eq!(validate_entry_name("logs").unwrap(), "logs");
+        assert!(validate_entry_name("").is_err());
+        assert!(validate_entry_name("../logs").is_err());
+        assert!(validate_entry_name(".").is_err());
     }
 }
