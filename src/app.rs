@@ -209,29 +209,6 @@ pub struct PasswordPrompt {
     pub input: String,
     pub return_to: Screen,
     pub open_after_save: bool,
-    pub mode: AuthPromptMode,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuthPromptMode {
-    SessionPassword,
-    OneTimeCode,
-}
-
-impl AuthPromptMode {
-    pub fn title(self) -> &'static str {
-        match self {
-            Self::SessionPassword => " Password ",
-            Self::OneTimeCode => " One-Time Auth ",
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::SessionPassword => "Password",
-            Self::OneTimeCode => "Code",
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -481,7 +458,6 @@ pub struct App {
     pub file: Option<FileSession>,
     pub transfer_jobs: Vec<TransferJob>,
     pub passwords: HashMap<String, PasswordHandle>,
-    pub one_time_codes: HashMap<String, PasswordHandle>,
     pub local_start: PathBuf,
     pub remote_start: Option<String>,
     pub show_hidden: bool,
@@ -526,7 +502,6 @@ impl App {
             file: None,
             transfer_jobs: Vec::new(),
             passwords: HashMap::new(),
-            one_time_codes: HashMap::new(),
             local_start: local_path,
             remote_start: remote_path,
             show_hidden,
@@ -538,7 +513,7 @@ impl App {
         };
 
         if let Some(host) = initial_host {
-            app.prompt_for_host_auth(host, Screen::Hosts, true, AuthPromptMode::OneTimeCode);
+            app.prompt_for_host_auth(host, Screen::Hosts, true);
         }
         Ok(app)
     }
@@ -599,13 +574,8 @@ impl App {
                     }
                 }
                 if let Some(host) = auth_prompt_host {
-                    self.prompt_for_host_auth(
-                        host.clone(),
-                        Screen::Files,
-                        false,
-                        AuthPromptMode::OneTimeCode,
-                    );
-                    self.message = Some(format!("authentication code required for {host}"));
+                    self.prompt_for_host_auth(host.clone(), Screen::Files, false);
+                    self.message = Some(format!("password required for {host}"));
                 }
             }
             AppEvent::PathCompleted {
@@ -661,13 +631,8 @@ impl App {
                     }
                 }
                 if let Some(host) = auth_prompt_host {
-                    self.prompt_for_host_auth(
-                        host.clone(),
-                        Screen::Files,
-                        false,
-                        AuthPromptMode::OneTimeCode,
-                    );
-                    self.message = Some(format!("authentication code required for {host}"));
+                    self.prompt_for_host_auth(host.clone(), Screen::Files, false);
+                    self.message = Some(format!("password required for {host}"));
                 }
             }
             AppEvent::TransferProgress {
@@ -696,13 +661,8 @@ impl App {
                     }
                 }
                 if let Some(host) = auth_prompt_host {
-                    self.prompt_for_host_auth(
-                        host.clone(),
-                        Screen::Files,
-                        false,
-                        AuthPromptMode::OneTimeCode,
-                    );
-                    self.message = Some(format!("authentication code required for {host}"));
+                    self.prompt_for_host_auth(host.clone(), Screen::Files, false);
+                    self.message = Some(format!("password required for {host}"));
                 }
             }
         }
@@ -728,12 +688,7 @@ impl App {
             KeyCode::PageUp => self.move_host_selection(-10),
             KeyCode::Enter => {
                 if let Some(alias) = self.selected_host_alias() {
-                    self.prompt_for_host_auth(
-                        alias,
-                        Screen::Hosts,
-                        true,
-                        AuthPromptMode::OneTimeCode,
-                    );
+                    self.prompt_for_host_auth(alias, Screen::Hosts, true);
                 }
             }
             KeyCode::Char('n') | KeyCode::Char('a') => {
@@ -945,16 +900,10 @@ impl App {
                 if prompt.open_after_save {
                     self.open_host(host.clone())?;
                     self.start(tx);
-                    if prompt.mode == AuthPromptMode::OneTimeCode {
-                        self.clear_one_time_code(&host);
-                    }
                 } else {
                     self.screen = prompt.return_to;
                     if let Some(file) = self.file.as_mut() {
                         file.request_remote_listing(file.remote_path.clone(), tx);
-                    }
-                    if prompt.mode == AuthPromptMode::OneTimeCode {
-                        self.clear_one_time_code(&host);
                     }
                 }
             }
@@ -1291,7 +1240,7 @@ impl App {
 
     fn open_host(&mut self, host: String) -> Result<()> {
         let connection = Connection {
-            password: self.effective_auth_handle(&host),
+            password: self.passwords.get(&host).cloned(),
             host,
             config_path: Some(self.ssh_config.path.clone()),
         };
@@ -1335,27 +1284,15 @@ impl App {
         let Some(host) = host else {
             return;
         };
-        self.prompt_for_host_auth(
-            host,
-            return_to,
-            open_after_save,
-            AuthPromptMode::SessionPassword,
-        );
+        self.prompt_for_host_auth(host, return_to, open_after_save);
     }
 
-    fn prompt_for_host_auth(
-        &mut self,
-        host: String,
-        return_to: Screen,
-        open_after_save: bool,
-        mode: AuthPromptMode,
-    ) {
+    fn prompt_for_host_auth(&mut self, host: String, return_to: Screen, open_after_save: bool) {
         self.password_prompt = Some(PasswordPrompt {
             host,
             input: String::new(),
             return_to,
             open_after_save,
-            mode,
         });
         self.screen = Screen::PasswordPrompt;
         self.message = None;
@@ -1363,54 +1300,19 @@ impl App {
 
     fn apply_auth_prompt(&mut self, prompt: &PasswordPrompt) -> Result<(), String> {
         let host = prompt.host.clone();
-        match prompt.mode {
-            AuthPromptMode::SessionPassword => {
-                if prompt.input.is_empty() {
-                    self.passwords.remove(&host);
-                    self.apply_effective_auth_handle(&host);
-                    self.message = Some(format!("cleared session password for {host}"));
-                    return Ok(());
-                }
-
-                let handle = PasswordHandle::new(&prompt.input)
-                    .map_err(|err| format!("could not store password: {err}"))?;
-                self.passwords.insert(host.clone(), handle);
-                self.apply_effective_auth_handle(&host);
-                self.message = Some(format!("session password set for {host}"));
-            }
-            AuthPromptMode::OneTimeCode => {
-                if prompt.input.is_empty() {
-                    self.one_time_codes.remove(&host);
-                    self.apply_effective_auth_handle(&host);
-                    self.message = Some(format!("no one-time code set for {host}"));
-                    return Ok(());
-                }
-
-                let handle = PasswordHandle::new(&prompt.input)
-                    .map_err(|err| format!("could not store one-time code: {err}"))?;
-                self.one_time_codes.insert(host.clone(), handle);
-                self.apply_effective_auth_handle(&host);
-                self.message = Some(format!("one-time auth code set for {host}"));
-            }
+        if prompt.input.is_empty() {
+            self.passwords.remove(&host);
+            self.set_open_file_password(&host, None);
+            self.message = Some(format!("cleared password for {host}"));
+            return Ok(());
         }
+
+        let handle = PasswordHandle::new(&prompt.input)
+            .map_err(|err| format!("could not store password: {err}"))?;
+        self.passwords.insert(host.clone(), handle.clone());
+        self.set_open_file_password(&host, Some(handle));
+        self.message = Some(format!("password set for {host}"));
         Ok(())
-    }
-
-    fn effective_auth_handle(&self, host: &str) -> Option<PasswordHandle> {
-        self.one_time_codes
-            .get(host)
-            .cloned()
-            .or_else(|| self.passwords.get(host).cloned())
-    }
-
-    fn apply_effective_auth_handle(&mut self, host: &str) {
-        let handle = self.effective_auth_handle(host);
-        self.set_open_file_password(host, handle);
-    }
-
-    fn clear_one_time_code(&mut self, host: &str) {
-        self.one_time_codes.remove(host);
-        self.apply_effective_auth_handle(host);
     }
 
     fn start_path_prompt(&mut self) {

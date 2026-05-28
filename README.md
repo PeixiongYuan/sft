@@ -29,7 +29,7 @@ Host picker:
 
 | Key | Action |
 | --- | --- |
-| `Enter` | Show one-time auth/OTP popup, then open selected host |
+| `Enter` | Show password popup, then open selected host |
 | `n` | Add a Host block |
 | `e` | Edit selected single-alias Host block |
 | `p` | Set or clear the selected host's session password |
@@ -72,11 +72,10 @@ File transfer:
 ## Notes
 
 - Requires `ssh` and `sftp` in `PATH`.
-- Works with key-based auth, `ssh-agent`, one-time OTP/auth codes, or a reusable session password set with `p`.
+- Works with key-based auth, `ssh-agent`, or a password entered in the popup.
 - Leave the auth popup blank and press `Enter` to use key/agent auth.
-- One-time OTP/auth codes are not cached; they are used for the current connection attempt and then cleared.
-- Session passwords are not written to `~/.ssh/config`; they are kept for the running `sft` process only and passed to OpenSSH through `SSH_ASKPASS`.
-- SSH multiplexing keeps authenticated connections alive for up to one hour of idle time.
+- Password input is not written to `~/.ssh/config`; it is kept for the running `sft` process only and passed to OpenSSH through `SSH_ASKPASS`.
+- SSH multiplexing keeps authenticated connections alive for up to four hours of idle time.
 - Host editing preserves unknown directives in a single-alias `Host` block, such as `ProxyJump` and `ForwardAgent`.
 - Wildcard and multi-alias `Host` blocks can be opened when concrete aliases are present, but are treated as read-only for safety.
 - Directory transfers use SFTP recursive `put/get -R`.

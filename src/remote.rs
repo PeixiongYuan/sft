@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use crate::askpass::PasswordHandle;
 use crate::browser::{self, Entry, Pane, SortMode};
 
-const CONTROL_PERSIST_SECS: u16 = 3600;
+const CONTROL_PERSIST_SECS: u32 = 14_400;
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const TCP_OVERALL_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -411,6 +411,10 @@ fn append_auth_options(command: &mut Command, connection: &Connection) {
         command
             .arg("-o")
             .arg("BatchMode=no")
+            .arg("-o")
+            .arg("PasswordAuthentication=yes")
+            .arg("-o")
+            .arg("KbdInteractiveAuthentication=yes")
             .arg("-o")
             .arg("NumberOfPasswordPrompts=1")
             .arg("-o")
