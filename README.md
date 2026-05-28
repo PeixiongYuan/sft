@@ -7,6 +7,12 @@ It is intentionally focused: SSH config host selection, basic host editing, spli
 ## Install
 
 ```sh
+cargo install sft
+```
+
+For local development:
+
+```sh
 cargo install --path .
 ```
 
