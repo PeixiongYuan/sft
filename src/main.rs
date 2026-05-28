@@ -2,6 +2,7 @@ mod app;
 mod askpass;
 mod browser;
 mod history;
+mod path_store;
 mod remote;
 mod ssh_config;
 mod tui;

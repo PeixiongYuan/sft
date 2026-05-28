@@ -10,6 +10,7 @@ use ratatui::widgets::ListState;
 use crate::askpass::PasswordHandle;
 use crate::browser::{self, Entry, Pane, SortMode};
 use crate::history::{HostHistory, HostStats};
+use crate::path_store::{PathEntry, PathStore};
 use crate::remote::{self, Connection};
 use crate::ssh_config::{HostDraft, SshConfig};
 
@@ -67,6 +68,7 @@ pub enum Screen {
     PasswordPrompt,
     PathPrompt,
     SearchPrompt,
+    PathList,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -347,8 +349,10 @@ impl FileSession {
 pub struct App {
     pub ssh_config: SshConfig,
     pub history: HostHistory,
+    pub path_store: PathStore,
     pub availability: HashMap<String, HostAvailability>,
     pub host_state: ListState,
+    pub path_state: ListState,
     pub screen: Screen,
     pub form: Option<HostForm>,
     pub password_prompt: Option<PasswordPrompt>,
@@ -374,13 +378,18 @@ impl App {
     ) -> Result<Self> {
         let ssh_config = SshConfig::load(config_path)?;
         let history = HostHistory::load_default();
+        let path_store = PathStore::load_default();
         let mut host_state = ListState::default();
         host_state.select(Some(0));
+        let mut path_state = ListState::default();
+        path_state.select(Some(0));
         let mut app = Self {
             ssh_config,
             history,
+            path_store,
             availability: HashMap::new(),
             host_state,
+            path_state,
             screen: Screen::Hosts,
             form: None,
             password_prompt: None,
@@ -420,6 +429,7 @@ impl App {
             Screen::PasswordPrompt => self.handle_password_key(key, tx),
             Screen::PathPrompt => self.handle_path_prompt_key(key, tx),
             Screen::SearchPrompt => self.handle_search_prompt_key(key),
+            Screen::PathList => self.handle_path_list_key(key, tx),
         }
     }
 
@@ -643,6 +653,8 @@ impl App {
             KeyCode::Char('f') => {
                 self.start_search_prompt();
             }
+            KeyCode::Char('b') => self.toggle_current_path_bookmark(),
+            KeyCode::Char('B') | KeyCode::Char('o') => self.start_path_list(),
             _ => {}
         }
 
@@ -933,6 +945,33 @@ impl App {
         Ok(())
     }
 
+    fn handle_path_list_key(&mut self, key: KeyEvent, tx: Sender<AppEvent>) -> Result<()> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.screen = Screen::Files;
+                self.message = None;
+            }
+            KeyCode::Down | KeyCode::Char('j') => self.move_path_selection(1),
+            KeyCode::Up | KeyCode::Char('k') => self.move_path_selection(-1),
+            KeyCode::PageDown => self.move_path_selection(8),
+            KeyCode::PageUp => self.move_path_selection(-8),
+            KeyCode::Char('b') => self.toggle_selected_path_bookmark(),
+            KeyCode::Enter => {
+                let Some(entry) = self.selected_path_entry() else {
+                    return Ok(());
+                };
+                match self.jump_to_path(entry.pane, &entry.path, tx) {
+                    Ok(()) => {
+                        self.screen = Screen::Files;
+                    }
+                    Err(err) => self.message = Some(err),
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn save_form(&mut self) {
         let Some(form) = self.form.clone() else {
             self.screen = Screen::Hosts;
@@ -985,6 +1024,7 @@ impl App {
                 .or_insert(HostAvailability::Reachable { rtt_ms: 0 });
             self.history.record_open(&file.connection.host);
         }
+        self.record_current_paths();
         self.screen = Screen::Files;
         self.message = None;
         Ok(())
@@ -998,7 +1038,8 @@ impl App {
             | Screen::DeleteHost
             | Screen::PasswordPrompt
             | Screen::PathPrompt
-            | Screen::SearchPrompt => None,
+            | Screen::SearchPrompt
+            | Screen::PathList => None,
         };
         let Some(host) = host else {
             return;
@@ -1089,6 +1130,7 @@ impl App {
                 self.message = Some(format!("remote path: {path}"));
             }
         }
+        self.record_path(pane);
 
         Ok(())
     }
@@ -1194,6 +1236,95 @@ impl App {
         self.message = None;
     }
 
+    fn start_path_list(&mut self) {
+        let Some(file) = self.file.as_ref() else {
+            return;
+        };
+        let entries = self.path_store.entries(&file.connection.host, file.active);
+        if entries.is_empty() {
+            self.message = Some("no saved paths for this pane".to_string());
+            return;
+        }
+        self.path_state.select(Some(0));
+        self.screen = Screen::PathList;
+        self.message = None;
+    }
+
+    fn toggle_current_path_bookmark(&mut self) {
+        let Some((host, pane, path)) = self.current_path_context() else {
+            return;
+        };
+        let pinned = self.path_store.toggle_bookmark(&host, pane, &path);
+        self.message = Some(if pinned {
+            format!("bookmarked {path}")
+        } else {
+            format!("unbookmarked {path}")
+        });
+    }
+
+    fn toggle_selected_path_bookmark(&mut self) {
+        let Some(entry) = self.selected_path_entry() else {
+            return;
+        };
+        let pinned = self
+            .path_store
+            .toggle_bookmark(&entry.host, entry.pane, &entry.path);
+        self.message = Some(if pinned {
+            format!("bookmarked {}", entry.path)
+        } else {
+            format!("unbookmarked {}", entry.path)
+        });
+    }
+
+    pub fn active_path_entries(&self) -> Vec<PathEntry> {
+        let Some(file) = self.file.as_ref() else {
+            return Vec::new();
+        };
+        self.path_store.entries(&file.connection.host, file.active)
+    }
+
+    fn selected_path_entry(&self) -> Option<PathEntry> {
+        let entries = self.active_path_entries();
+        let idx = self.path_state.selected().unwrap_or(0);
+        entries.get(idx).cloned()
+    }
+
+    fn move_path_selection(&mut self, delta: isize) {
+        let len = self.active_path_entries().len();
+        if len == 0 {
+            return;
+        }
+        let current = self.path_state.selected().unwrap_or(0).min(len - 1) as isize;
+        let next = (current + delta).clamp(0, len as isize - 1) as usize;
+        self.path_state.select(Some(next));
+    }
+
+    fn record_current_paths(&mut self) {
+        self.record_path(Pane::Local);
+        self.record_path(Pane::Remote);
+    }
+
+    fn record_path(&mut self, pane: Pane) {
+        let Some((host, pane, path)) = self.path_context(pane) else {
+            return;
+        };
+        self.path_store.record_recent(&host, pane, &path);
+    }
+
+    fn current_path_context(&self) -> Option<(String, Pane, String)> {
+        let file = self.file.as_ref()?;
+        self.path_context(file.active)
+    }
+
+    fn path_context(&self, pane: Pane) -> Option<(String, Pane, String)> {
+        let file = self.file.as_ref()?;
+        let path = match pane {
+            Pane::Local => file.local_path.display().to_string(),
+            Pane::Remote => file.remote_path.clone(),
+        };
+        Some((file.connection.host.clone(), pane, path))
+    }
+
     fn handle_confirm_key(&mut self, key: KeyEvent, tx: Sender<AppEvent>) {
         match key.code {
             KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
@@ -1265,6 +1396,7 @@ impl App {
                 if entry.is_dir {
                     file.local_path = file.local_path.join(entry.name);
                     let _ = file.refresh_local();
+                    self.record_path(Pane::Local);
                 } else {
                     file.confirm = Some(CopyPlan {
                         source: Pane::Local,
@@ -1281,6 +1413,7 @@ impl App {
                 if entry.is_dir {
                     let new_path = browser::join_remote_path(&file.remote_path, &entry.name);
                     file.request_remote_listing(new_path, tx);
+                    self.record_path(Pane::Remote);
                 } else {
                     file.confirm = Some(CopyPlan {
                         source: Pane::Remote,
@@ -1301,6 +1434,7 @@ impl App {
                 if let Some(parent) = file.local_path.parent() {
                     file.local_path = parent.to_path_buf();
                     let _ = file.refresh_local();
+                    self.record_path(Pane::Local);
                 }
             }
             Pane::Remote => {
@@ -1310,6 +1444,7 @@ impl App {
                 let parent = browser::parent_remote_path(&file.remote_path);
                 if parent != file.remote_path {
                     file.request_remote_listing(parent, tx);
+                    self.record_path(Pane::Remote);
                 }
             }
         }

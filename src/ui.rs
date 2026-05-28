@@ -21,6 +21,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Screen::PasswordPrompt => render_password(frame, app),
         Screen::PathPrompt => render_path_prompt(frame, app),
         Screen::SearchPrompt => render_search_prompt(frame, app),
+        Screen::PathList => render_path_list(frame, app),
     }
 }
 
@@ -438,6 +439,69 @@ fn render_search_prompt(frame: &mut Frame, app: &mut App) {
     );
 }
 
+fn render_path_list(frame: &mut Frame, app: &mut App) {
+    render_files(frame, app);
+
+    let area = frame.area();
+    let Some(file) = app.file.as_ref() else {
+        return;
+    };
+    let pane = file.active;
+    let entries = app.active_path_entries();
+    let rect = centered_rect(area, 76, 18);
+    frame.render_widget(Clear, rect);
+
+    let items = entries
+        .iter()
+        .map(|entry| {
+            let mark = if entry.pinned { "*" } else { " " };
+            let age = browser::format_relative_time(entry.last_used);
+            ListItem::new(Line::from(vec![
+                Span::styled(format!(" {mark} "), Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    truncate(&entry.path, rect.width.saturating_sub(20) as usize),
+                    Style::default().fg(Color::White),
+                ),
+                Span::raw(" "),
+                Span::styled(age, Style::default().fg(Color::DarkGray)),
+            ]))
+        })
+        .collect::<Vec<_>>();
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" {} Paths ", pane.label())),
+        )
+        .highlight_symbol(">")
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+    StatefulWidget::render(list, rect, frame.buffer_mut(), &mut app.path_state);
+
+    let help = Rect::new(
+        rect.x + 2,
+        rect.y + rect.height.saturating_sub(2),
+        rect.width.saturating_sub(4),
+        1,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            key("Enter"),
+            Span::raw(" jump  "),
+            key("b"),
+            Span::raw(" bookmark  "),
+            key("Esc"),
+            Span::raw(" close"),
+        ])),
+        help,
+    );
+}
+
 fn render_form(frame: &mut Frame, app: &mut App) {
     render_hosts(frame, app);
 
@@ -778,6 +842,10 @@ fn render_file_footer(frame: &mut Frame, message: Option<&str>, file: &FileSessi
         Span::raw(" goto  "),
         key("f"),
         Span::raw(" find  "),
+        key("b"),
+        Span::raw(" mark  "),
+        key("B/o"),
+        Span::raw(" paths  "),
         key("p"),
         Span::raw(" password  "),
         key("q"),
