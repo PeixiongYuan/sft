@@ -1,0 +1,20 @@
+[package]
+name = "sft"
+version = "0.1.0"
+edition = "2024"
+description = "A focused SSH file transfer TUI."
+license = "MIT"
+keywords = ["ssh", "scp", "sftp", "tui", "files"]
+categories = ["command-line-utilities", "development-tools"]
+rust-version = "1.95"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.29"
+dirs = "6"
+ratatui = "0.30"
+unicode-width = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
