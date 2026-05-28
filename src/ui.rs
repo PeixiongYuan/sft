@@ -10,7 +10,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
     App, CopyPlan, DeletePlan, FileSession, HostAvailability, HostField, HostFormMode,
-    NamePromptKind, Screen,
+    NamePromptKind, Screen, TransferJobStatus,
 };
 use crate::browser::{self, Entry, Pane};
 use crate::history::{HostStats, format_last_opened};
@@ -26,6 +26,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Screen::SearchPrompt => render_search_prompt(frame, app),
         Screen::PathList => render_path_list(frame, app),
         Screen::NamePrompt => render_name_prompt(frame, app),
+        Screen::TransferJobs => render_transfer_jobs(frame, app),
     }
 }
 
@@ -555,6 +556,89 @@ fn render_name_prompt(frame: &mut Frame, app: &mut App) {
     );
 }
 
+fn render_transfer_jobs(frame: &mut Frame, app: &mut App) {
+    render_files(frame, app);
+
+    let area = frame.area();
+    let rect = centered_rect(area, 82, 20);
+    frame.render_widget(Clear, rect);
+
+    let items = app
+        .transfer_jobs
+        .iter()
+        .map(|job| {
+            let (status, style) = transfer_status(job.status);
+            let finished = job.finished_at.unwrap_or_else(now_epoch);
+            let duration = finished.saturating_sub(job.started_at);
+            let names = if job.names.len() == 1 {
+                job.names[0].clone()
+            } else {
+                format!("{} items", job.names.len())
+            };
+            let detail = match job.status {
+                TransferJobStatus::Failed => job.error.as_deref().unwrap_or("failed").to_string(),
+                _ => format!(
+                    "{} -> {}",
+                    truncate(&job.local_path, 20),
+                    truncate(&job.remote_path, 20)
+                ),
+            };
+            ListItem::new(vec![
+                Line::from(vec![
+                    Span::styled(format!("{:<7}", status), style),
+                    Span::raw(" "),
+                    Span::styled(job.direction.label(), Style::default().fg(Color::Yellow)),
+                    Span::raw(format!("  {}  ", format_duration(duration))),
+                    Span::styled(job.host.clone(), Style::default().fg(Color::DarkGray)),
+                ]),
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        truncate(&names, rect.width.saturating_sub(8) as usize),
+                        Style::default().fg(Color::White),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        truncate(&detail, rect.width.saturating_sub(8) as usize),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]),
+            ])
+        })
+        .collect::<Vec<_>>();
+
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(" Transfers "))
+        .highlight_symbol(">")
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+    StatefulWidget::render(list, rect, frame.buffer_mut(), &mut app.transfer_state);
+
+    let help = Rect::new(
+        rect.x + 2,
+        rect.y + rect.height.saturating_sub(2),
+        rect.width.saturating_sub(4),
+        1,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            key("j/k"),
+            Span::raw(" move  "),
+            key("c"),
+            Span::raw(" clear finished  "),
+            key("t/Esc"),
+            Span::raw(" close"),
+        ])),
+        help,
+    );
+}
+
 fn render_form(frame: &mut Frame, app: &mut App) {
     render_hosts(frame, app);
 
@@ -912,6 +996,8 @@ fn render_file_footer(frame: &mut Frame, message: Option<&str>, file: &FileSessi
             Span::raw(" mark  "),
             key("B/o"),
             Span::raw(" paths  "),
+            key("t"),
+            Span::raw(" jobs  "),
             key("p"),
             Span::raw(" password  "),
             key("q"),
@@ -1030,6 +1116,24 @@ fn render_transfer(frame: &mut Frame, label: &str, area: Rect) {
         .block(Block::default().borders(Borders::ALL).title(" Transfer ")),
         rect,
     );
+}
+
+fn transfer_status(status: TransferJobStatus) -> (&'static str, Style) {
+    match status {
+        TransferJobStatus::Running => ("running", Style::default().fg(Color::Cyan)),
+        TransferJobStatus::Succeeded => ("done", Style::default().fg(Color::Green)),
+        TransferJobStatus::Failed => ("failed", Style::default().fg(Color::Red)),
+    }
+}
+
+fn format_duration(seconds: i64) -> String {
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m{}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h{}m", seconds / 3600, (seconds % 3600) / 60)
+    }
 }
 
 fn format_endpoint(host: &HostEntry) -> String {

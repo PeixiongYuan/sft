@@ -65,6 +65,7 @@ File transfer:
 | `x`, `D` | Delete selected items or the current item after confirmation |
 | `b` | Bookmark or unbookmark the active path |
 | `B`, `o` | Open bookmarked/recent paths for the active pane |
+| `t` | Show transfer job history |
 | `p` | Set or replace the session password for this host |
 | `q`, `Esc` | Quit |
 

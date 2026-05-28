@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -36,6 +37,7 @@ pub enum AppEvent {
         result: Result<Option<PathCompletion>, String>,
     },
     TransferFinished {
+        job_id: u64,
         result: Result<(), String>,
     },
     FileOperationFinished {
@@ -74,6 +76,7 @@ pub enum Screen {
     SearchPrompt,
     PathList,
     NamePrompt,
+    TransferJobs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +84,42 @@ pub enum FileOperation {
     Mkdir,
     Rename,
     Delete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferDirection {
+    Upload,
+    Download,
+}
+
+impl TransferDirection {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Upload => "upload",
+            Self::Download => "download",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferJobStatus {
+    Running,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+pub struct TransferJob {
+    pub id: u64,
+    pub host: String,
+    pub direction: TransferDirection,
+    pub names: Vec<String>,
+    pub local_path: String,
+    pub remote_path: String,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    pub status: TransferJobStatus,
+    pub error: Option<String>,
 }
 
 impl FileOperation {
@@ -397,6 +436,7 @@ pub struct App {
     pub availability: HashMap<String, HostAvailability>,
     pub host_state: ListState,
     pub path_state: ListState,
+    pub transfer_state: ListState,
     pub screen: Screen,
     pub form: Option<HostForm>,
     pub password_prompt: Option<PasswordPrompt>,
@@ -404,6 +444,7 @@ pub struct App {
     pub search_prompt: Option<SearchPrompt>,
     pub name_prompt: Option<NamePrompt>,
     pub file: Option<FileSession>,
+    pub transfer_jobs: Vec<TransferJob>,
     pub passwords: HashMap<String, PasswordHandle>,
     pub local_start: PathBuf,
     pub remote_start: Option<String>,
@@ -411,6 +452,8 @@ pub struct App {
     pub message: Option<String>,
     pub should_quit: bool,
     direct_host: bool,
+    next_transfer_job_id: u64,
+    active_transfer_job_id: Option<u64>,
 }
 
 impl App {
@@ -428,6 +471,8 @@ impl App {
         host_state.select(Some(0));
         let mut path_state = ListState::default();
         path_state.select(Some(0));
+        let mut transfer_state = ListState::default();
+        transfer_state.select(Some(0));
         let mut app = Self {
             ssh_config,
             history,
@@ -435,6 +480,7 @@ impl App {
             availability: HashMap::new(),
             host_state,
             path_state,
+            transfer_state,
             screen: Screen::Hosts,
             form: None,
             password_prompt: None,
@@ -442,6 +488,7 @@ impl App {
             search_prompt: None,
             name_prompt: None,
             file: None,
+            transfer_jobs: Vec::new(),
             passwords: HashMap::new(),
             local_start: local_path,
             remote_start: remote_path,
@@ -449,6 +496,8 @@ impl App {
             message: None,
             should_quit: false,
             direct_host: initial_host.is_some(),
+            next_transfer_job_id: 1,
+            active_transfer_job_id: None,
         };
 
         if let Some(host) = initial_host {
@@ -477,6 +526,7 @@ impl App {
             Screen::SearchPrompt => self.handle_search_prompt_key(key),
             Screen::PathList => self.handle_path_list_key(key, tx),
             Screen::NamePrompt => self.handle_name_prompt_key(key, tx),
+            Screen::TransferJobs => self.handle_transfer_jobs_key(key),
         }
     }
 
@@ -547,11 +597,13 @@ impl App {
                     }
                 }
             }
-            AppEvent::TransferFinished { result } => {
+            AppEvent::TransferFinished { job_id, result } => {
                 let mut auth_prompt_host = None;
                 if let Some(file) = self.file.as_mut() {
                     file.transferring = None;
                 }
+                self.active_transfer_job_id = None;
+                self.finish_transfer_job(job_id, &result);
                 match result {
                     Ok(()) => {
                         self.refresh_file_panes(tx)?;
@@ -665,6 +717,9 @@ impl App {
             .as_ref()
             .is_some_and(|file| file.transferring.is_some())
         {
+            if matches!(key.code, KeyCode::Char('t')) {
+                self.start_transfer_jobs();
+            }
             return Ok(());
         }
 
@@ -737,6 +792,7 @@ impl App {
             KeyCode::Char('x') | KeyCode::Char('D') => self.start_delete_confirm(),
             KeyCode::Char('b') => self.toggle_current_path_bookmark(),
             KeyCode::Char('B') | KeyCode::Char('o') => self.start_path_list(),
+            KeyCode::Char('t') => self.start_transfer_jobs(),
             _ => {}
         }
 
@@ -1121,6 +1177,22 @@ impl App {
         Ok(())
     }
 
+    fn handle_transfer_jobs_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('t') => {
+                self.screen = Screen::Files;
+                self.message = None;
+            }
+            KeyCode::Down | KeyCode::Char('j') => self.move_transfer_selection(1),
+            KeyCode::Up | KeyCode::Char('k') => self.move_transfer_selection(-1),
+            KeyCode::PageDown => self.move_transfer_selection(8),
+            KeyCode::PageUp => self.move_transfer_selection(-8),
+            KeyCode::Char('c') => self.clear_finished_transfer_jobs(),
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn save_form(&mut self) {
         let Some(form) = self.form.clone() else {
             self.screen = Screen::Hosts;
@@ -1189,7 +1261,8 @@ impl App {
             | Screen::PathPrompt
             | Screen::SearchPrompt
             | Screen::PathList
-            | Screen::NamePrompt => None,
+            | Screen::NamePrompt
+            | Screen::TransferJobs => None,
         };
         let Some(host) = host else {
             return;
@@ -1398,6 +1471,65 @@ impl App {
         self.path_state.select(Some(0));
         self.screen = Screen::PathList;
         self.message = None;
+    }
+
+    fn start_transfer_jobs(&mut self) {
+        if self.transfer_jobs.is_empty() {
+            self.message = Some("no transfer jobs yet".to_string());
+            return;
+        }
+        self.clamp_transfer_selection();
+        self.screen = Screen::TransferJobs;
+        self.message = None;
+    }
+
+    fn move_transfer_selection(&mut self, delta: isize) {
+        let len = self.transfer_jobs.len();
+        if len == 0 {
+            return;
+        }
+        let current = self.transfer_state.selected().unwrap_or(0).min(len - 1) as isize;
+        let next = (current + delta).clamp(0, len as isize - 1) as usize;
+        self.transfer_state.select(Some(next));
+    }
+
+    fn clear_finished_transfer_jobs(&mut self) {
+        self.transfer_jobs
+            .retain(|job| job.status == TransferJobStatus::Running);
+        self.clamp_transfer_selection();
+        self.message = Some("cleared finished transfer jobs".to_string());
+    }
+
+    fn clamp_transfer_selection(&mut self) {
+        let len = self.transfer_jobs.len();
+        if len == 0 {
+            self.transfer_state.select(Some(0));
+        } else {
+            let idx = self.transfer_state.selected().unwrap_or(0).min(len - 1);
+            self.transfer_state.select(Some(idx));
+        }
+    }
+
+    fn push_transfer_job(&mut self, job: TransferJob) {
+        self.transfer_jobs.insert(0, job);
+        self.transfer_jobs.truncate(100);
+        self.transfer_state.select(Some(0));
+    }
+
+    fn finish_transfer_job(&mut self, job_id: u64, result: &Result<(), String>) {
+        if let Some(job) = self.transfer_jobs.iter_mut().find(|job| job.id == job_id) {
+            job.finished_at = Some(now_epoch());
+            match result {
+                Ok(()) => {
+                    job.status = TransferJobStatus::Succeeded;
+                    job.error = None;
+                }
+                Err(err) => {
+                    job.status = TransferJobStatus::Failed;
+                    job.error = Some(err.clone());
+                }
+            }
+        }
     }
 
     fn toggle_current_path_bookmark(&mut self) {
@@ -1678,16 +1810,36 @@ impl App {
             plan.has_dirs,
         );
         let direction = match plan.source {
-            Pane::Local => "upload",
-            Pane::Remote => "download",
+            Pane::Local => TransferDirection::Upload,
+            Pane::Remote => TransferDirection::Download,
         };
-        file.transferring = Some(format!("{direction} {} item(s)", plan.names.len()));
+        let job_id = self.next_transfer_job_id;
+        self.next_transfer_job_id = self.next_transfer_job_id.saturating_add(1);
+        self.active_transfer_job_id = Some(job_id);
+        let job = TransferJob {
+            id: job_id,
+            host: file.connection.host.clone(),
+            direction,
+            names: plan.names.clone(),
+            local_path: file.local_path.display().to_string(),
+            remote_path: file.remote_path.clone(),
+            started_at: now_epoch(),
+            finished_at: None,
+            status: TransferJobStatus::Running,
+            error: None,
+        };
+        file.transferring = Some(format!(
+            "{} {} item(s)",
+            direction.label(),
+            plan.names.len()
+        ));
         self.message = None;
 
         let connection = file.connection.clone();
+        self.push_transfer_job(job);
         thread::spawn(move || {
             let result = remote::run_scp(&connection, &args);
-            let _ = tx.send(AppEvent::TransferFinished { result });
+            let _ = tx.send(AppEvent::TransferFinished { job_id, result });
         });
     }
 
@@ -1996,6 +2148,13 @@ fn validate_entry_name(input: &str) -> Result<String, String> {
         return Err("name cannot contain /".to_string());
     }
     Ok(name.to_string())
+}
+
+fn now_epoch() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 fn resolve_local_jump_path(current: &Path, input: &str) -> Result<PathBuf, String> {
