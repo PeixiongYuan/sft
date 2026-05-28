@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -8,7 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use crate::askpass::PasswordHandle;
-use crate::browser::{self, Entry, SortMode};
+use crate::browser::{self, Entry, Pane, SortMode};
 
 const CONTROL_PERSIST_SECS: u16 = 600;
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -32,18 +33,10 @@ pub struct TcpCheckTarget {
 }
 
 pub fn remote_pwd(connection: &Connection) -> Result<String> {
-    let output = ssh_command(connection, "pwd")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .with_context(|| format!("failed to run ssh for {}", connection.host))?;
-
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("{}", useful_error(&stderr, output.status.code()));
-    }
+    let output = run_sftp_batch(connection, "pwd\n")
+        .map_err(anyhow::Error::msg)
+        .with_context(|| format!("failed to run sftp for {}", connection.host))?;
+    parse_sftp_pwd(&output).context("sftp pwd returned no directory")
 }
 
 pub fn fetch_remote_listing(
@@ -52,88 +45,40 @@ pub fn fetch_remote_listing(
     show_hidden: bool,
     sort: SortMode,
 ) -> Result<Vec<Entry>, String> {
-    let command = format!("LC_ALL=C ls -lhAL {}", browser::shell_escape(path));
-    let output = ssh_command(connection, &command)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|err| format!("failed to spawn ssh: {err}"))?;
-
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        Ok(browser::parse_ls_output(&stdout, show_hidden, sort))
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(useful_error(&stderr, output.status.code()))
-    }
+    let script = format!("ls -lah {}\n", sftp_quote(path));
+    let output = run_sftp_batch(connection, &script)?;
+    Ok(browser::parse_ls_output(&output, show_hidden, sort))
 }
 
 pub fn fetch_remote_directories(
     connection: &Connection,
     path: &str,
 ) -> Result<Vec<String>, String> {
-    let dir = browser::shell_escape(path);
-    let command = format!(
-        "for p in {dir}/* {dir}/.[!.]* {dir}/..?*; do \
-         [ -d \"$p\" ] || continue; \
-         b=${{p##*/}}; \
-         [ \"$b\" = . ] || [ \"$b\" = .. ] || printf '%s\\n' \"$b\"; \
-         done"
-    );
-    let output = ssh_command(connection, &command)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|err| format!("failed to spawn ssh: {err}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(useful_error(&stderr, output.status.code()));
-    }
-
-    let mut dirs = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|name| !name.is_empty() && *name != "." && *name != "..")
-        .map(ToString::to_string)
+    let mut dirs = fetch_remote_listing(connection, path, true, SortMode::Name)?
+        .into_iter()
+        .filter(|entry| entry.is_dir)
+        .map(|entry| entry.name)
         .collect::<Vec<_>>();
     dirs.sort_by_key(|name| name.to_ascii_lowercase());
     dirs.dedup();
     Ok(dirs)
 }
 
-pub fn run_scp(connection: &Connection, args: &[String]) -> Result<(), String> {
-    let mut command = Command::new("scp");
-    append_config(&mut command, connection);
-    append_mux_options(&mut command);
-    append_auth_options(&mut command, connection);
-    for arg in args {
-        command.arg(arg);
-    }
-
-    let output = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|err| format!("failed to spawn scp: {err}"))?;
-
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(useful_error(&stderr, output.status.code()))
-    }
+pub fn run_sftp_transfer(
+    connection: &Connection,
+    source: Pane,
+    local_path: &Path,
+    remote_path: &str,
+    names: &[String],
+    has_dirs: bool,
+) -> Result<(), String> {
+    let script = build_sftp_transfer_batch(source, local_path, remote_path, names, has_dirs);
+    run_sftp_batch(connection, &script).map(|_| ())
 }
 
 pub fn create_remote_dir(connection: &Connection, path: &str, name: &str) -> Result<(), String> {
     let target = browser::join_remote_path(path, name);
-    run_remote_shell(
-        connection,
-        &format!("mkdir -p -- {}", browser::shell_escape(&target)),
-    )
+    run_sftp_batch(connection, &format!("mkdir {}\n", sftp_quote(&target))).map(|_| ())
 }
 
 pub fn rename_remote_entry(
@@ -144,24 +89,33 @@ pub fn rename_remote_entry(
 ) -> Result<(), String> {
     let source = browser::join_remote_path(path, old_name);
     let target = browser::join_remote_path(path, new_name);
-    let source = browser::shell_escape(&source);
-    let target = browser::shell_escape(&target);
-    run_remote_shell(
+    run_sftp_batch(
         connection,
-        &format!(
-            "if [ -e {target} ]; then printf '%s\\n' 'target already exists' >&2; exit 1; fi; mv -- {source} {target}"
-        ),
+        &format!("rename {} {}\n", sftp_quote(&source), sftp_quote(&target)),
     )
+    .map(|_| ())
 }
 
 pub fn delete_remote_entries(
     connection: &Connection,
     path: &str,
     names: &[String],
+    has_dirs: bool,
 ) -> Result<(), String> {
     if names.is_empty() {
         return Ok(());
     }
+    if !has_dirs {
+        let script = names
+            .iter()
+            .map(|name| {
+                let target = browser::join_remote_path(path, name);
+                format!("rm {}\n", sftp_quote(&target))
+            })
+            .collect::<String>();
+        return run_sftp_batch(connection, &script).map(|_| ());
+    }
+
     let targets = names
         .iter()
         .map(|name| browser::shell_escape(&browser::join_remote_path(path, name)))
@@ -208,6 +162,92 @@ pub fn resolve_tcp_check_target(host: &str, config_path: Option<&Path>) -> TcpCh
     }
 }
 
+fn build_sftp_transfer_batch(
+    source: Pane,
+    local_path: &Path,
+    remote_path: &str,
+    names: &[String],
+    has_dirs: bool,
+) -> String {
+    let recursive = if has_dirs { "R" } else { "" };
+    let flags = format!("-p{recursive}");
+    let mut script = String::new();
+
+    match source {
+        Pane::Local => {
+            let remote_dir = browser::ensure_remote_dir(remote_path);
+            for name in names {
+                let local = local_path.join(name).to_string_lossy().into_owned();
+                script.push_str(&format!(
+                    "put {flags} {} {}\n",
+                    sftp_quote(&local),
+                    sftp_quote(&remote_dir)
+                ));
+            }
+        }
+        Pane::Remote => {
+            let local_dir = local_path.to_string_lossy().into_owned();
+            for name in names {
+                let remote = browser::join_remote_path(remote_path, name);
+                script.push_str(&format!(
+                    "get {flags} {} {}\n",
+                    sftp_quote(&remote),
+                    sftp_quote(&local_dir)
+                ));
+            }
+        }
+    }
+
+    script
+}
+
+fn run_sftp_batch(connection: &Connection, script: &str) -> Result<String, String> {
+    let mut command = sftp_command(connection);
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("failed to spawn sftp: {err}"))?;
+
+    let Some(mut stdin) = child.stdin.take() else {
+        return Err("failed to open sftp stdin".to_string());
+    };
+    stdin
+        .write_all(script.as_bytes())
+        .map_err(|err| format!("failed to write sftp batch: {err}"))?;
+    drop(stdin);
+
+    let output = child
+        .wait_with_output()
+        .map_err(|err| format!("failed to wait for sftp: {err}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Err(useful_error(
+            &format!("{stderr}\n{stdout}"),
+            output.status.code(),
+        ))
+    }
+}
+
+fn sftp_command(connection: &Connection) -> Command {
+    let mut command = Command::new("sftp");
+    append_config(&mut command, connection);
+    command
+        .arg("-q")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg("-o")
+        .arg("ClearAllForwardings=yes");
+    append_mux_options(&mut command);
+    append_auth_options(&mut command, connection);
+    command.arg("-b").arg("-").arg(&connection.host);
+    command
+}
+
 fn run_remote_shell(connection: &Connection, remote_command: &str) -> Result<(), String> {
     let output = ssh_command(connection, remote_command)
         .stdin(Stdio::null())
@@ -222,6 +262,39 @@ fn run_remote_shell(connection: &Connection, remote_command: &str) -> Result<(),
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(useful_error(&stderr, output.status.code()))
     }
+}
+
+fn parse_sftp_pwd(output: &str) -> Option<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .find_map(|line| {
+            line.strip_prefix("Remote working directory: ")
+                .or_else(|| line.strip_prefix("Remote working directory:"))
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            let trimmed = output.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
+}
+
+fn sftp_quote(value: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '\\' | '"' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            '\n' | '\r' => out.push(' '),
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn ssh_command(connection: &Connection, remote_command: &str) -> Command {
@@ -506,5 +579,50 @@ mod tests {
         let bare_ipv6 = parse_proxy_jump_target("2001:db8::2");
         assert_eq!(bare_ipv6.host, "2001:db8::2");
         assert_eq!(bare_ipv6.port, None);
+    }
+
+    #[test]
+    fn builds_sftp_upload_batch() {
+        let batch = build_sftp_transfer_batch(
+            Pane::Local,
+            Path::new("/tmp/local"),
+            "/var/www",
+            &[String::from("app bundle.tar")],
+            false,
+        );
+
+        assert_eq!(
+            batch,
+            "put -p \"/tmp/local/app bundle.tar\" \"/var/www/\"\n"
+        );
+    }
+
+    #[test]
+    fn builds_sftp_recursive_download_batch() {
+        let batch = build_sftp_transfer_batch(
+            Pane::Remote,
+            Path::new("/tmp/local"),
+            "/var/www",
+            &[String::from("assets")],
+            true,
+        );
+
+        assert_eq!(batch, "get -pR \"/var/www/assets\" \"/tmp/local\"\n");
+    }
+
+    #[test]
+    fn quotes_sftp_paths() {
+        assert_eq!(
+            sftp_quote(r#"/tmp/a "quote" dir"#),
+            r#""/tmp/a \"quote\" dir""#
+        );
+    }
+
+    #[test]
+    fn parses_sftp_pwd_output() {
+        assert_eq!(
+            parse_sftp_pwd("Remote working directory: /home/deploy\n").as_deref(),
+            Some("/home/deploy")
+        );
     }
 }

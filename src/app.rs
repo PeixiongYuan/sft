@@ -1716,6 +1716,13 @@ impl App {
                 self.message = Some(format!("renamed {old_name} to {new_name}"));
             }
             Pane::Remote => {
+                if file
+                    .remote_entries
+                    .iter()
+                    .any(|entry| entry.name == new_name)
+                {
+                    return Err(format!("target already exists: {new_name}"));
+                }
                 let connection = file.connection.clone();
                 let path = file.remote_path.clone();
                 file.transferring = Some(format!("renaming {old_name}"));
@@ -1747,11 +1754,13 @@ impl App {
                 let connection = file.connection.clone();
                 let path = file.remote_path.clone();
                 let count = plan.names.len();
+                let has_dirs = plan.has_dirs;
                 let names = plan.names;
                 file.transferring = Some(format!("deleting {count} item(s)"));
                 thread::spawn(move || {
-                    let result = remote::delete_remote_entries(&connection, &path, &names)
-                        .map(|()| format!("deleted {count} remote item(s)"));
+                    let result =
+                        remote::delete_remote_entries(&connection, &path, &names, has_dirs)
+                            .map(|()| format!("deleted {count} remote item(s)"));
                     let _ = tx.send(AppEvent::FileOperationFinished {
                         operation: FileOperation::Delete,
                         result,
@@ -1805,14 +1814,6 @@ impl App {
         let Some(file) = self.file.as_mut() else {
             return;
         };
-        let args = browser::build_scp_args(
-            &file.connection.host,
-            plan.source,
-            &file.local_path,
-            &file.remote_path,
-            &plan.names,
-            plan.has_dirs,
-        );
         let direction = match plan.source {
             Pane::Local => TransferDirection::Upload,
             Pane::Remote => TransferDirection::Download,
@@ -1840,9 +1841,21 @@ impl App {
         self.message = None;
 
         let connection = file.connection.clone();
+        let source = plan.source;
+        let local_path = file.local_path.clone();
+        let remote_path = file.remote_path.clone();
+        let names = plan.names.clone();
+        let has_dirs = plan.has_dirs;
         self.push_transfer_job(job);
         thread::spawn(move || {
-            let result = remote::run_scp(&connection, &args);
+            let result = remote::run_sftp_transfer(
+                &connection,
+                source,
+                &local_path,
+                &remote_path,
+                &names,
+                has_dirs,
+            );
             let _ = tx.send(AppEvent::TransferFinished { job_id, result });
         });
     }

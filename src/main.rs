@@ -20,7 +20,7 @@ use app::App;
     name = "sft",
     version,
     about = "Split-pane SSH file transfer TUI",
-    long_about = "sft reads your SSH config, lets you choose or edit a Host entry, then opens a keyboard-driven local/remote file browser and copies files over OpenSSH scp."
+    long_about = "sft reads your SSH config, lets you choose or edit a Host entry, then opens a keyboard-driven local/remote file browser and copies files over OpenSSH sftp."
 )]
 struct Cli {
     /// SSH host, alias, or user@host target. Omit to choose from ssh config.

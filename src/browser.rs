@@ -172,38 +172,6 @@ fn parse_long_listing_line(line: &str, show_hidden: bool) -> Option<Entry> {
     })
 }
 
-pub fn build_scp_args(
-    host: &str,
-    source: Pane,
-    local_path: &Path,
-    remote_path: &str,
-    filenames: &[String],
-    has_dirs: bool,
-) -> Vec<String> {
-    let mut args = Vec::new();
-    if has_dirs {
-        args.push("-r".to_string());
-    }
-    args.push("--".to_string());
-
-    match source {
-        Pane::Local => {
-            for name in filenames {
-                args.push(local_path.join(name).to_string_lossy().into_owned());
-            }
-            args.push(format!("{}:{}", host, ensure_remote_dir(remote_path)));
-        }
-        Pane::Remote => {
-            for name in filenames {
-                args.push(format!("{}:{}", host, join_remote_path(remote_path, name)));
-            }
-            args.push(local_path.to_string_lossy().into_owned());
-        }
-    }
-
-    args
-}
-
 pub fn parent_remote_path(path: &str) -> String {
     let trimmed = path.trim();
     if trimmed == "/" {
@@ -420,32 +388,6 @@ drwxr-xr-x  2 me staff  64 May 28 10:00 docs
         assert_eq!(entries[0].name, "docs");
         assert_eq!(entries[1].name, "report final.txt");
         assert_eq!(entries[1].size, Some(1536));
-    }
-
-    #[test]
-    fn builds_upload_scp_args() {
-        let args = build_scp_args(
-            "web",
-            Pane::Local,
-            Path::new("/tmp/local"),
-            "/var/www",
-            &[String::from("app.tar")],
-            false,
-        );
-        assert_eq!(args, vec!["--", "/tmp/local/app.tar", "web:/var/www/"]);
-    }
-
-    #[test]
-    fn builds_download_scp_args_with_recursive_flag() {
-        let args = build_scp_args(
-            "web",
-            Pane::Remote,
-            Path::new("/tmp/local"),
-            "/var/www",
-            &[String::from("assets")],
-            true,
-        );
-        assert_eq!(args, vec!["-r", "--", "web:/var/www/assets", "/tmp/local"]);
     }
 
     #[test]

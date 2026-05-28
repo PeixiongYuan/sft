@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "A focused SSH file transfer TUI."
 license = "MIT"
-keywords = ["ssh", "scp", "sftp", "tui", "files"]
+keywords = ["ssh", "sftp", "tui", "files"]
 categories = ["command-line-utilities", "development-tools"]
 rust-version = "1.95"
 

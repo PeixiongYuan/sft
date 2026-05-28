@@ -2,7 +2,7 @@
 
 `sft` is a small Rust TUI for choosing an SSH config host and moving files between your local machine and that host.
 
-It is intentionally focused: SSH config host selection, basic host editing, split-pane browsing, multi-select, confirmation, and transfer over OpenSSH `scp`. It uses your existing SSH setup, including `~/.ssh/config`, agent keys, `ProxyJump`, and host aliases.
+It is intentionally focused: SSH config host selection, basic host editing, split-pane browsing, multi-select, confirmation, and transfer over OpenSSH `sftp`. It uses your existing SSH setup, including `~/.ssh/config`, agent keys, `ProxyJump`, and host aliases.
 
 ## Install
 
@@ -71,13 +71,13 @@ File transfer:
 
 ## Notes
 
-- Requires `ssh` and `scp` in `PATH`.
+- Requires `ssh` and `sftp` in `PATH`.
 - Works with key-based auth, `ssh-agent`, or a session password entered in the popup shown before opening a host.
 - Leave the password popup blank and press `Enter` to use key/agent auth.
 - Passwords are not written to `~/.ssh/config`; they are kept for the running `sft` process only and passed to OpenSSH through `SSH_ASKPASS`.
 - Host editing preserves unknown directives in a single-alias `Host` block, such as `ProxyJump` and `ForwardAgent`.
 - Wildcard and multi-alias `Host` blocks can be opened when concrete aliases are present, but are treated as read-only for safety.
-- Directory copies use `scp -r`.
+- Directory transfers use SFTP recursive `put/get -R`.
 - Transfers may overwrite existing destination files, so `sft` always asks for confirmation.
 - Delete operations are recursive for directories and always ask for confirmation.
 
