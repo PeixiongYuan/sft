@@ -754,10 +754,14 @@ impl App {
             KeyCode::PageUp => self.move_file_selection(-10),
             KeyCode::Enter => self.activate_file(tx),
             KeyCode::Backspace => self.go_parent(tx),
-            KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char(' ') | KeyCode::Char('m')
+                if key.modifiers.is_empty() || key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 self.toggle_current_file_selection();
             }
-            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('a')
+                if key.modifiers.is_empty() || key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 self.toggle_all_files();
             }
             KeyCode::Char('.') => {

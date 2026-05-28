@@ -53,8 +53,8 @@ File transfer:
 | `Enter` | Open directory or copy file/selection |
 | `Backspace` | Go to parent directory |
 | `j/k`, arrows | Move selection |
-| `Ctrl-Space` | Toggle selected item |
-| `Ctrl-A` | Select or clear all visible entries |
+| `Space`, `m` | Toggle selected item |
+| `a`, `Ctrl-A` | Select or clear all visible entries |
 | `.` | Toggle dotfiles |
 | `s` | Cycle sort mode |
 | `r` | Refresh both panes |
