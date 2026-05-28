@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use crate::askpass::PasswordHandle;
 use crate::browser::{self, Entry, Pane, SortMode};
 
-const CONTROL_PERSIST_SECS: u16 = 600;
+const CONTROL_PERSIST_SECS: u16 = 3600;
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const TCP_OVERALL_TIMEOUT: Duration = Duration::from_secs(5);
 

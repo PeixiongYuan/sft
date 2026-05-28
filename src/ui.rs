@@ -254,15 +254,23 @@ fn render_password(frame: &mut Frame, app: &mut App) {
         return;
     };
     let masked = "*".repeat(prompt.input.chars().count());
-    let action = if prompt.open_after_save {
-        "open"
-    } else {
-        "save"
+    let action = match (prompt.mode, prompt.open_after_save) {
+        (_, true) => "open",
+        (crate::app::AuthPromptMode::SessionPassword, false) => "save",
+        (crate::app::AuthPromptMode::OneTimeCode, false) => "retry",
     };
-    let empty_action = if prompt.open_after_save {
-        "use key/agent"
-    } else {
-        "clear"
+    let empty_action = match (prompt.mode, prompt.open_after_save) {
+        (_, true) => "use key/agent",
+        (crate::app::AuthPromptMode::SessionPassword, false) => "clear",
+        (crate::app::AuthPromptMode::OneTimeCode, false) => "skip code",
+    };
+    let hint = match prompt.mode {
+        crate::app::AuthPromptMode::SessionPassword => {
+            "Stored only for this sft process. Leave blank to clear."
+        }
+        crate::app::AuthPromptMode::OneTimeCode => {
+            "One-time code is used for this connection attempt only."
+        }
     };
 
     let lines = vec![
@@ -272,14 +280,11 @@ fn render_password(frame: &mut Frame, app: &mut App) {
             Span::styled(prompt.host.clone(), Style::default().fg(Color::Yellow)),
         ]),
         Line::from(vec![
-            Span::raw("Password  "),
+            Span::raw(format!("{:<10}", prompt.mode.label())),
             Span::styled(masked, Style::default().fg(Color::Cyan)),
         ]),
         Line::from(""),
-        Line::from(Span::styled(
-            "Leave blank to use SSH key/agent.",
-            Style::default().fg(Color::DarkGray),
-        )),
+        Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray))),
         Line::from(vec![
             key("Enter"),
             Span::raw(format!(" {action}  ")),
@@ -291,7 +296,11 @@ fn render_password(frame: &mut Frame, app: &mut App) {
     ];
 
     frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Password ")),
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(prompt.mode.title()),
+        ),
         rect,
     );
 }
