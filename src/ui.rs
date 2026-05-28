@@ -10,7 +10,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
     App, CopyPlan, DeletePlan, FileSession, HostAvailability, HostField, HostFormMode,
-    NamePromptKind, Screen, TransferJobStatus,
+    NamePromptKind, Screen, TransferJob, TransferJobStatus,
 };
 use crate::browser::{self, Entry, Pane};
 use crate::history::{HostStats, format_last_opened};
@@ -607,6 +607,7 @@ fn render_transfer_jobs(frame: &mut Frame, app: &mut App) {
                         Style::default().fg(Color::White),
                     ),
                 ]),
+                transfer_progress_line(job, rect.width.saturating_sub(8) as usize),
                 Line::from(vec![
                     Span::raw("  "),
                     Span::styled(
@@ -738,6 +739,7 @@ fn render_delete_confirm(frame: &mut Frame, app: &App, area: Rect) {
 
 fn render_files(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+    let active_transfer_job = app.active_transfer_job().cloned();
     let Some(file) = app.file.as_mut() else {
         frame.render_widget(Paragraph::new("No host open."), area);
         return;
@@ -813,7 +815,7 @@ fn render_files(frame: &mut Frame, app: &mut App) {
     }
 
     if let Some(label) = file.transferring.as_deref() {
-        render_transfer(frame, label, area);
+        render_transfer(frame, label, active_transfer_job.as_ref(), area);
     }
 }
 
@@ -1114,17 +1116,90 @@ fn render_file_delete_confirm(frame: &mut Frame, plan: &DeletePlan, area: Rect) 
     );
 }
 
-fn render_transfer(frame: &mut Frame, label: &str, area: Rect) {
-    let rect = centered_rect(area, 48, 5);
+fn render_transfer(frame: &mut Frame, label: &str, job: Option<&TransferJob>, area: Rect) {
+    let rect = centered_rect(area, 64, 7);
     frame.render_widget(Clear, rect);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(vec![
             Span::raw("  "),
             Span::styled(label.to_string(), Style::default().fg(Color::Cyan)),
-        ]))
-        .block(Block::default().borders(Borders::ALL).title(" Transfer ")),
+        ]),
+    ];
+    if let Some(job) = job {
+        lines.push(transfer_progress_line(
+            job,
+            rect.width.saturating_sub(6) as usize,
+        ));
+    } else {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("starting...", Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+    lines.push(Line::from(""));
+
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Transfer ")),
         rect,
     );
+}
+
+fn transfer_progress_line(job: &TransferJob, width: usize) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            truncate(&transfer_progress_text(job), width),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])
+}
+
+fn transfer_progress_text(job: &TransferJob) -> String {
+    let speed = format_transfer_speed(job.speed_bps);
+    let transferred = browser::format_size(job.transferred_bytes);
+    match job.total_bytes {
+        Some(total) => {
+            let percent = transfer_percent(job).unwrap_or(0);
+            let bar = transfer_progress_bar(job, 12);
+            format!(
+                "{bar} {percent:>3}%  {transferred} / {}  {speed}",
+                browser::format_size(total)
+            )
+        }
+        None => format!("{transferred} transferred  {speed}"),
+    }
+}
+
+fn transfer_progress_bar(job: &TransferJob, width: usize) -> String {
+    let Some(total) = job.total_bytes else {
+        return String::new();
+    };
+    if width == 0 {
+        return String::new();
+    }
+    let filled = if total == 0 {
+        width
+    } else {
+        let transferred = job.transferred_bytes.min(total);
+        ((transferred as f64 / total as f64) * width as f64).round() as usize
+    }
+    .min(width);
+    format!("[{}{}]", "█".repeat(filled), "░".repeat(width - filled))
+}
+
+fn transfer_percent(job: &TransferJob) -> Option<u64> {
+    let total = job.total_bytes?;
+    if total == 0 {
+        return Some(100);
+    }
+    Some(((job.transferred_bytes.min(total) as u128 * 100) / total as u128) as u64)
+}
+
+fn format_transfer_speed(speed_bps: Option<u64>) -> String {
+    speed_bps
+        .map(|speed| format!("{}/s", browser::format_size(speed)))
+        .unwrap_or_else(|| "--/s".to_string())
 }
 
 fn transfer_status(status: TransferJobStatus) -> (&'static str, Style) {

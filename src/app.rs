@@ -1,8 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Sender;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Sender};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -39,6 +41,11 @@ pub enum AppEvent {
     TransferFinished {
         job_id: u64,
         result: Result<(), String>,
+    },
+    TransferProgress {
+        job_id: u64,
+        transferred_bytes: u64,
+        total_bytes: Option<u64>,
     },
     FileOperationFinished {
         operation: FileOperation,
@@ -120,6 +127,11 @@ pub struct TransferJob {
     pub finished_at: Option<i64>,
     pub status: TransferJobStatus,
     pub error: Option<String>,
+    pub transferred_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub speed_bps: Option<u64>,
+    last_progress_at: Option<i64>,
+    last_progress_bytes: u64,
 }
 
 impl FileOperation {
@@ -657,6 +669,13 @@ impl App {
                     );
                     self.message = Some(format!("authentication code required for {host}"));
                 }
+            }
+            AppEvent::TransferProgress {
+                job_id,
+                transferred_bytes,
+                total_bytes,
+            } => {
+                self.update_transfer_progress(job_id, transferred_bytes, total_bytes);
             }
             AppEvent::FileOperationFinished { operation, result } => {
                 let mut auth_prompt_host = None;
@@ -1636,6 +1655,9 @@ impl App {
                 Ok(()) => {
                     job.status = TransferJobStatus::Succeeded;
                     job.error = None;
+                    if let Some(total) = job.total_bytes {
+                        job.transferred_bytes = total;
+                    }
                 }
                 Err(err) => {
                     job.status = TransferJobStatus::Failed;
@@ -1643,6 +1665,38 @@ impl App {
                 }
             }
         }
+    }
+
+    fn update_transfer_progress(
+        &mut self,
+        job_id: u64,
+        transferred_bytes: u64,
+        total_bytes: Option<u64>,
+    ) {
+        let Some(job) = self.transfer_jobs.iter_mut().find(|job| job.id == job_id) else {
+            return;
+        };
+        if job.status == TransferJobStatus::Failed {
+            return;
+        }
+
+        if total_bytes.is_some() {
+            job.total_bytes = total_bytes;
+        }
+
+        let transferred_bytes = transferred_bytes.max(job.transferred_bytes);
+        let now = now_millis();
+        if let Some(last_at) = job.last_progress_at {
+            let elapsed_ms = now.saturating_sub(last_at);
+            let delta_bytes = transferred_bytes.saturating_sub(job.last_progress_bytes);
+            if elapsed_ms > 0 {
+                job.speed_bps = Some(delta_bytes.saturating_mul(1000) / elapsed_ms as u64);
+            }
+        }
+
+        job.transferred_bytes = transferred_bytes;
+        job.last_progress_bytes = transferred_bytes;
+        job.last_progress_at = Some(now);
     }
 
     fn toggle_current_path_bookmark(&mut self) {
@@ -1676,6 +1730,11 @@ impl App {
             return Vec::new();
         };
         self.path_store.entries(&file.connection.host, file.active)
+    }
+
+    pub fn active_transfer_job(&self) -> Option<&TransferJob> {
+        let job_id = self.active_transfer_job_id?;
+        self.transfer_jobs.iter().find(|job| job.id == job_id)
     }
 
     fn selected_path_entry(&self) -> Option<PathEntry> {
@@ -1941,6 +2000,11 @@ impl App {
             finished_at: None,
             status: TransferJobStatus::Running,
             error: None,
+            transferred_bytes: 0,
+            total_bytes: transfer_source_total(file, &plan),
+            speed_bps: None,
+            last_progress_at: None,
+            last_progress_bytes: 0,
         };
         file.transferring = Some(format!(
             "{} {} item(s)",
@@ -1955,6 +2019,18 @@ impl App {
         let remote_path = file.remote_path.clone();
         let names = plan.names.clone();
         let has_dirs = plan.has_dirs;
+        let progress_plan = TransferProgressPlan {
+            connection: connection.clone(),
+            direction,
+            local_path: local_path.clone(),
+            remote_path: remote_path.clone(),
+            names: names.clone(),
+            total_bytes: job.total_bytes,
+            baseline_bytes: transfer_target_baseline(file, direction, &names),
+        };
+        let progress_done = Arc::new(AtomicBool::new(false));
+        let transfer_done = Arc::clone(&progress_done);
+        spawn_transfer_progress_watcher(job_id, progress_plan, tx.clone(), progress_done);
         self.push_transfer_job(job);
         thread::spawn(move || {
             let result = remote::run_sftp_transfer(
@@ -1965,6 +2041,7 @@ impl App {
                 &names,
                 has_dirs,
             );
+            transfer_done.store(true, Ordering::Relaxed);
             let _ = tx.send(AppEvent::TransferFinished { job_id, result });
         });
     }
@@ -2262,6 +2339,167 @@ fn delete_local_entries(base: &Path, names: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct TransferProgressPlan {
+    connection: Connection,
+    direction: TransferDirection,
+    local_path: PathBuf,
+    remote_path: String,
+    names: Vec<String>,
+    total_bytes: Option<u64>,
+    baseline_bytes: u64,
+}
+
+impl TransferProgressPlan {
+    fn source_total_bytes(&self) -> Option<u64> {
+        match self.direction {
+            TransferDirection::Upload => local_entries_size(&self.local_path, &self.names).ok(),
+            TransferDirection::Download => {
+                remote::remote_entries_size(&self.connection, &self.remote_path, &self.names).ok()
+            }
+        }
+    }
+
+    fn target_bytes(&self) -> Option<u64> {
+        match self.direction {
+            TransferDirection::Upload => {
+                remote::remote_entries_size(&self.connection, &self.remote_path, &self.names).ok()
+            }
+            TransferDirection::Download => local_entries_size(&self.local_path, &self.names).ok(),
+        }
+    }
+
+    fn transferred_bytes(&self) -> Option<u64> {
+        self.target_bytes()
+            .map(|bytes| bytes.saturating_sub(self.baseline_bytes))
+    }
+}
+
+fn spawn_transfer_progress_watcher(
+    job_id: u64,
+    plan: TransferProgressPlan,
+    tx: Sender<AppEvent>,
+    done: Arc<AtomicBool>,
+) {
+    thread::spawn(move || {
+        let mut total_bytes = plan.total_bytes;
+        let mut total_rx = if total_bytes.is_none() {
+            let total_plan = plan.clone();
+            let (total_tx, total_rx) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = total_tx.send(total_plan.source_total_bytes());
+            });
+            Some(total_rx)
+        } else {
+            None
+        };
+
+        loop {
+            if total_bytes.is_none()
+                && let Some(rx) = &total_rx
+            {
+                match rx.try_recv() {
+                    Ok(Some(total)) => {
+                        total_bytes = Some(total);
+                        total_rx = None;
+                    }
+                    Ok(None) | Err(mpsc::TryRecvError::Disconnected) => {
+                        total_rx = None;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                }
+            }
+
+            if let Some(transferred_bytes) = plan.transferred_bytes() {
+                let transferred_bytes = total_bytes
+                    .map(|total| transferred_bytes.min(total))
+                    .unwrap_or(transferred_bytes);
+                let _ = tx.send(AppEvent::TransferProgress {
+                    job_id,
+                    transferred_bytes,
+                    total_bytes,
+                });
+            }
+
+            if done.load(Ordering::Relaxed) {
+                break;
+            }
+
+            thread::sleep(Duration::from_millis(700));
+        }
+    });
+}
+
+fn transfer_source_total(file: &FileSession, plan: &CopyPlan) -> Option<u64> {
+    if plan.has_dirs {
+        return None;
+    }
+
+    let entries = match plan.source {
+        Pane::Local => &file.local_entries,
+        Pane::Remote => &file.remote_entries,
+    };
+    listed_entries_size(entries, &plan.names)
+}
+
+fn transfer_target_baseline(
+    file: &FileSession,
+    direction: TransferDirection,
+    names: &[String],
+) -> u64 {
+    let entries = match direction {
+        TransferDirection::Upload => &file.remote_entries,
+        TransferDirection::Download => &file.local_entries,
+    };
+    listed_existing_file_size(entries, names)
+}
+
+fn listed_entries_size(entries: &[Entry], names: &[String]) -> Option<u64> {
+    names.iter().try_fold(0u64, |total, name| {
+        let entry = entries.iter().find(|entry| entry.name == *name)?;
+        if entry.is_dir {
+            return None;
+        }
+        entry.size.map(|size| total.saturating_add(size))
+    })
+}
+
+fn listed_existing_file_size(entries: &[Entry], names: &[String]) -> u64 {
+    names
+        .iter()
+        .filter_map(|name| entries.iter().find(|entry| entry.name == *name))
+        .filter(|entry| !entry.is_dir)
+        .filter_map(|entry| entry.size)
+        .fold(0u64, u64::saturating_add)
+}
+
+fn local_entries_size(base: &Path, names: &[String]) -> Result<u64, String> {
+    names.iter().try_fold(0u64, |total, name| {
+        local_path_size(&base.join(name)).map(|size| total.saturating_add(size))
+    })
+}
+
+fn local_path_size(path: &Path) -> Result<u64, String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|err| format!("could not inspect {}: {err}", path.display()))?;
+    let file_type = metadata.file_type();
+    if file_type.is_file() {
+        return Ok(metadata.len());
+    }
+    if !file_type.is_dir() {
+        return Ok(0);
+    }
+
+    let mut total = 0u64;
+    let entries = std::fs::read_dir(path)
+        .map_err(|err| format!("could not read directory {}: {err}", path.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("could not read directory entry: {err}"))?;
+        total = total.saturating_add(local_path_size(&entry.path())?);
+    }
+    Ok(total)
+}
+
 fn validate_entry_name(input: &str) -> Result<String, String> {
     let name = input.trim();
     if name.is_empty() {
@@ -2281,6 +2519,14 @@ fn now_epoch() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
 }
 
 fn resolve_local_jump_path(current: &Path, input: &str) -> Result<PathBuf, String> {
@@ -2518,17 +2764,17 @@ mod tests {
 
     #[test]
     fn completion_filters_unfiltered_names_by_prefix() {
-        let names = ["archive", "storage", "storage-fast", "tmp"]
+        let names = ["archive", "project", "project-fast", "tmp"]
             .into_iter()
             .map(String::from)
             .collect::<Vec<_>>();
 
-        let completion = completion_from_names("", "stor", &names).expect("completion");
+        let completion = completion_from_names("", "proj", &names).expect("completion");
 
-        assert_eq!(completion.replacement, Some("storage".to_string()));
+        assert_eq!(completion.replacement, Some("project".to_string()));
         assert_eq!(
             completion.candidates,
-            vec!["storage/".to_string(), "storage-fast/".to_string()]
+            vec!["project/".to_string(), "project-fast/".to_string()]
         );
     }
 
@@ -2539,7 +2785,7 @@ mod tests {
             .map(String::from)
             .collect::<Vec<_>>();
 
-        assert!(completion_from_names("", "stor", &names).is_none());
+        assert!(completion_from_names("", "proj", &names).is_none());
     }
 
     #[test]
@@ -2548,5 +2794,21 @@ mod tests {
         assert!(validate_entry_name("").is_err());
         assert!(validate_entry_name("../logs").is_err());
         assert!(validate_entry_name(".").is_err());
+    }
+
+    #[test]
+    fn local_entries_size_counts_nested_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("top.bin"), b"abc").unwrap();
+        std::fs::create_dir(dir.path().join("nested")).unwrap();
+        std::fs::write(dir.path().join("nested").join("child.bin"), b"12345").unwrap();
+
+        let size = local_entries_size(
+            dir.path(),
+            &[String::from("top.bin"), String::from("nested")],
+        )
+        .unwrap();
+
+        assert_eq!(size, 8);
     }
 }

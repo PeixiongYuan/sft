@@ -124,6 +124,42 @@ pub fn delete_remote_entries(
     run_remote_shell(connection, &format!("rm -rf -- {targets}"))
 }
 
+pub fn remote_entries_size(
+    connection: &Connection,
+    path: &str,
+    names: &[String],
+) -> Result<u64, String> {
+    if names.is_empty() {
+        return Ok(0);
+    }
+
+    let targets = names
+        .iter()
+        .map(|name| browser::shell_escape(&browser::join_remote_path(path, name)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let command = format!(
+        r#"sft_size() {{
+    if [ -f "$1" ]; then
+        stat -c %s -- "$1" 2>/dev/null || stat -f %z "$1" 2>/dev/null || wc -c < "$1" 2>/dev/null || printf 0
+    elif [ -d "$1" ]; then
+        find "$1" -type f -exec sh -c 'for f do stat -c %s -- "$f" 2>/dev/null || stat -f %z "$f" 2>/dev/null || wc -c < "$f" 2>/dev/null || printf 0; done' sh {{}} + 2>/dev/null | awk '{{s += $1}} END {{print s+0}}'
+    else
+        printf 0
+    fi
+}}
+total=0
+for p in {targets}; do
+    size=$(sft_size "$p")
+    total=$((total + size))
+done
+printf '%s\n' "$total"
+"#
+    );
+    let output = run_remote_shell_output(connection, &command)?;
+    parse_remote_size_output(&output)
+}
+
 pub fn check_reachability(host: &str, config_path: Option<&Path>) -> Option<u32> {
     let target = resolve_tcp_check_target(host, config_path);
     tcp_connect_rtt(&target.hostname, target.port)
@@ -262,6 +298,40 @@ fn run_remote_shell(connection: &Connection, remote_command: &str) -> Result<(),
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(useful_error(&stderr, output.status.code()))
     }
+}
+
+fn run_remote_shell_output(
+    connection: &Connection,
+    remote_command: &str,
+) -> Result<String, String> {
+    let output = ssh_command(connection, remote_command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|err| format!("failed to spawn ssh: {err}"))?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Err(useful_error(
+            &format!("{stderr}\n{stdout}"),
+            output.status.code(),
+        ))
+    }
+}
+
+fn parse_remote_size_output(output: &str) -> Result<u64, String> {
+    output
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .ok_or_else(|| "remote size command returned no output".to_string())?
+        .parse::<u64>()
+        .map_err(|err| format!("could not parse remote size: {err}"))
 }
 
 fn parse_sftp_pwd(output: &str) -> Option<String> {
@@ -624,5 +694,10 @@ mod tests {
             parse_sftp_pwd("Remote working directory: /home/deploy\n").as_deref(),
             Some("/home/deploy")
         );
+    }
+
+    #[test]
+    fn parses_remote_size_output_from_last_line() {
+        assert_eq!(parse_remote_size_output("debug\n42\n").unwrap(), 42);
     }
 }
