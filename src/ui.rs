@@ -105,7 +105,7 @@ fn render_host_list(
             let endpoint = format_endpoint(host);
             let readonly = if host.editable() { "" } else { " read-only" };
             let alias_width = 20usize.min(width / 3).max(10);
-            let status_width = 4;
+            let status_width = 3;
             let endpoint_width = width.saturating_sub(alias_width + status_width + 14);
             let status = *availability
                 .get(&host.alias)
@@ -130,7 +130,7 @@ fn render_host_list(
 
     let list = List::new(items)
         .block(block)
-        .highlight_symbol("▌")
+        .highlight_symbol("> ")
         .highlight_style(selection_style());
     StatefulWidget::render(list, area, frame.buffer_mut(), state);
 }
@@ -154,13 +154,14 @@ fn render_host_sidebar(
         .unwrap_or(&HostAvailability::Unknown);
     let (marker, marker_style) = availability_marker(status);
     let status_label = availability_label(status);
+    let status_label_style = availability_text_style(status);
     let chart_width = area.width.saturating_sub(4) as usize;
 
     let mut lines = vec![
         Line::from(vec![
             Span::styled(marker.to_string(), marker_style),
             Span::raw(" "),
-            Span::styled(status_label.clone(), marker_style),
+            Span::styled(status_label.clone(), status_label_style),
         ]),
         Line::from(""),
         detail_line("Host", &host.alias),
@@ -444,7 +445,7 @@ fn render_path_list(frame: &mut Frame, app: &mut App) {
 
     let list = List::new(items)
         .block(modal_block(format!(" {} Paths ", pane.label())))
-        .highlight_symbol("▌")
+        .highlight_symbol("> ")
         .highlight_style(selection_style());
     StatefulWidget::render(list, rect, frame.buffer_mut(), &mut app.path_state);
 
@@ -569,7 +570,7 @@ fn render_transfer_jobs(frame: &mut Frame, app: &mut App) {
 
     let list = List::new(items)
         .block(modal_block(" Transfers "))
-        .highlight_symbol("▌")
+        .highlight_symbol("> ")
         .highlight_style(selection_style());
     StatefulWidget::render(list, rect, frame.buffer_mut(), &mut app.transfer_state);
 
@@ -827,7 +828,7 @@ fn render_pane(
     let items = file_items(entries, selected, area.width.saturating_sub(2) as usize);
     let list = List::new(items)
         .block(block)
-        .highlight_symbol("▌")
+        .highlight_symbol("> ")
         .highlight_style(selection_style());
     StatefulWidget::render(list, area, frame.buffer_mut(), state);
 }
@@ -857,7 +858,7 @@ fn file_items<'a>(
 
     for entry in entries {
         let mark = if selected.contains(&entry.name) {
-            "●"
+            "*"
         } else {
             " "
         };
@@ -1170,7 +1171,7 @@ fn availability_marker(status: HostAvailability) -> (&'static str, Style) {
         HostAvailability::Checking => ("…", warning_style()),
         HostAvailability::Reachable { .. } => ("●", success_style()),
         HostAvailability::Slow { .. } => ("▲", warning_style()),
-        HostAvailability::Unreachable => ("✕", danger_style()),
+        HostAvailability::Unreachable => ("x", danger_style()),
     }
 }
 
@@ -1181,6 +1182,16 @@ fn availability_label(status: HostAvailability) -> String {
         HostAvailability::Reachable { rtt_ms } => format!("reachable ({})", format_rtt(rtt_ms)),
         HostAvailability::Slow { rtt_ms } => format!("slow ({})", format_rtt(rtt_ms)),
         HostAvailability::Unreachable => "unreachable".to_string(),
+    }
+}
+
+fn availability_text_style(status: HostAvailability) -> Style {
+    match status {
+        HostAvailability::Unknown => dim_style(),
+        HostAvailability::Checking => warning_style(),
+        HostAvailability::Reachable { .. } => success_style(),
+        HostAvailability::Slow { .. } => warning_style(),
+        HostAvailability::Unreachable => danger_style(),
     }
 }
 
@@ -1383,22 +1394,19 @@ fn message_style() -> Style {
 }
 
 fn warning_style() -> Style {
-    Style::default().fg(Color::Yellow)
+    Style::default().fg(Color::LightYellow)
 }
 
 fn success_style() -> Style {
-    Style::default().fg(Color::Green)
+    Style::default().fg(Color::LightGreen)
 }
 
 fn danger_style() -> Style {
-    Style::default().fg(Color::Red)
+    Style::default().fg(Color::LightRed)
 }
 
 fn selection_style() -> Style {
-    Style::default()
-        .fg(Color::Black)
-        .bg(Color::Cyan)
-        .add_modifier(Modifier::BOLD)
+    Style::default().add_modifier(Modifier::BOLD)
 }
 
 fn key(value: &'static str) -> Span<'static> {

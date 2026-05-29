@@ -1,8 +1,13 @@
 # sft
 
-`sft` is a small Rust TUI for choosing an SSH config host and moving files between your local machine and that host.
+`sft` is a small Rust TUI for choosing an SSH config host and moving files between your serves.
 
-It is intentionally focused: SSH config host selection, basic host editing, split-pane browsing, multi-select, confirmation, and transfer over OpenSSH `sftp`. It uses your existing SSH setup, including `~/.ssh/config`, agent keys, `ProxyJump`, and host aliases.
+
+## Preview
+
+<img src="assets/sft-demo.png" alt="sft host picker preview with simulated data" width="900">
+
+<img src="assets/sft-transfer-demo.png" alt="sft file transfer preview with simulated data" width="900">
 
 ## Install
 
@@ -13,7 +18,7 @@ cargo install sft
 For local development:
 
 ```sh
-cargo install --path .
+cargo install --path path/to/install
 ```
 
 ## Usage
@@ -22,9 +27,6 @@ cargo install --path .
 sft
 ```
 
-Run `sft` to open the host picker from `~/.ssh/config`.
-
-The host picker shows a status marker on each row: a green circle means the SSH TCP endpoint is reachable, a yellow triangle means it is slow, and a red `x` means it is unreachable. This check does not attempt SSH authentication or ask for a password. The right sidebar shows the selected host's basic SSH fields, local usage stats, and a small login activity bar plot.
 
 ## Keys
 
@@ -75,15 +77,6 @@ File transfer:
 ## Notes
 
 - Requires `ssh` and `sftp` in `PATH`.
-- Works with key-based auth, `ssh-agent`, or a password entered in the popup.
-- Leave the auth popup blank and press `Enter` to use key/agent auth.
-- Password input is not written to `~/.ssh/config`; it is kept for the running `sft` process only and passed to OpenSSH through `SSH_ASKPASS`.
-- SSH multiplexing keeps authenticated connections alive for up to four hours of idle time.
-- Host editing preserves unknown directives in a single-alias `Host` block, such as `ProxyJump` and `ForwardAgent`.
-- Wildcard and multi-alias `Host` blocks can be opened when concrete aliases are present, but are treated as read-only for safety.
-- Directory transfers use SFTP recursive `put/get -R`.
-- Transfers may overwrite existing destination files, so `sft` always asks for confirmation.
-- Delete operations are recursive for directories and always ask for confirmation.
 
 ## Development
 
