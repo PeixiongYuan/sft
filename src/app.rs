@@ -2432,12 +2432,12 @@ fn now_millis() -> i64 {
 }
 
 fn resolve_local_jump_path(current: &Path, input: &str) -> Result<PathBuf, String> {
-    let raw = input.trim();
+    let raw = parse_path_input(input);
     if raw.is_empty() {
         return Err("local directory is required".to_string());
     }
 
-    let path = expand_local_jump_path(current, raw)?;
+    let path = expand_local_jump_path(current, &raw)?;
     let path = path.canonicalize().unwrap_or(path);
     if path.is_dir() {
         Ok(path)
@@ -2447,6 +2447,7 @@ fn resolve_local_jump_path(current: &Path, input: &str) -> Result<PathBuf, Strin
 }
 
 fn expand_local_jump_path(current: &Path, input: &str) -> Result<PathBuf, String> {
+    let input = parse_path_input(input);
     if input == "~" {
         return dirs::home_dir().ok_or_else(|| "could not determine home directory".to_string());
     }
@@ -2465,7 +2466,7 @@ fn expand_local_jump_path(current: &Path, input: &str) -> Result<PathBuf, String
 }
 
 fn resolve_remote_jump_path(current: &str, home: &str, input: &str) -> Option<String> {
-    let raw = input.trim();
+    let raw = parse_path_input(input);
     if raw.is_empty() {
         return None;
     }
@@ -2478,10 +2479,10 @@ fn resolve_remote_jump_path(current: &str, home: &str, input: &str) -> Option<St
         )));
     }
     if raw.starts_with('/') {
-        return Some(normalize_remote_path(raw));
+        return Some(normalize_remote_path(&raw));
     }
     Some(normalize_remote_path(&browser::join_remote_path(
-        current, raw,
+        current, &raw,
     )))
 }
 
@@ -2512,7 +2513,7 @@ fn normalize_remote_path(path: &str) -> String {
 }
 
 fn complete_local_path(current: &Path, input: &str) -> Option<PathCompletion> {
-    let raw = input.trim();
+    let raw = parse_path_input(input);
     if raw == "~" {
         return Some(PathCompletion {
             replacement: Some("~/".to_string()),
@@ -2520,7 +2521,7 @@ fn complete_local_path(current: &Path, input: &str) -> Option<PathCompletion> {
         });
     }
 
-    let (head, prefix) = split_completion_input(raw);
+    let (head, prefix) = split_completion_input(&raw);
     let dir = if head.is_empty() {
         current.to_path_buf()
     } else {
@@ -2574,7 +2575,7 @@ struct PathCompletionQuery {
 }
 
 fn remote_completion_query(current: &str, home: &str, input: &str) -> Option<PathCompletionQuery> {
-    let raw = input.trim();
+    let raw = parse_path_input(input);
     if raw == "~" {
         return Some(PathCompletionQuery {
             base: home.to_string(),
@@ -2583,7 +2584,7 @@ fn remote_completion_query(current: &str, home: &str, input: &str) -> Option<Pat
         });
     }
 
-    let (head, prefix) = split_completion_input(raw);
+    let (head, prefix) = split_completion_input(&raw);
     let base = if head.is_empty() {
         current.to_string()
     } else if head == "/" {
@@ -2604,6 +2605,44 @@ fn split_completion_input(input: &str) -> (&str, &str) {
         .rfind('/')
         .map(|idx| (&input[..=idx], &input[idx + 1..]))
         .unwrap_or(("", input))
+}
+
+fn parse_path_input(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut quote = None;
+    let mut escaped = false;
+
+    for ch in input.trim().chars() {
+        if escaped {
+            out.push(ch);
+            escaped = false;
+            continue;
+        }
+
+        if ch == '\\' && quote != Some('\'') {
+            escaped = true;
+            continue;
+        }
+
+        if ch == '\'' || ch == '"' {
+            if quote == Some(ch) {
+                quote = None;
+                continue;
+            }
+            if quote.is_none() {
+                quote = Some(ch);
+                continue;
+            }
+        }
+
+        out.push(ch);
+    }
+
+    if escaped {
+        out.push('\\');
+    }
+
+    out
 }
 
 fn completion_from_names(head: &str, prefix: &str, names: &[String]) -> Option<PathCompletion> {
@@ -2688,6 +2727,57 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(completion_from_names("", "proj", &names).is_none());
+    }
+
+    #[test]
+    fn path_input_accepts_shell_style_spaces() {
+        assert_eq!(parse_path_input(r#""/tmp/my folder""#), "/tmp/my folder");
+        assert_eq!(parse_path_input(r"/tmp/my\ folder"), "/tmp/my folder");
+        assert_eq!(
+            parse_path_input(r#"/tmp/"my folder"/next"#),
+            "/tmp/my folder/next"
+        );
+    }
+
+    #[test]
+    fn remote_jump_accepts_escaped_and_quoted_spaces() {
+        assert_eq!(
+            resolve_remote_jump_path("/home/me", "/home/me", r"project\ data").as_deref(),
+            Some("/home/me/project data")
+        );
+        assert_eq!(
+            resolve_remote_jump_path("/home/me", "/home/me", r#""/scratch/project data""#)
+                .as_deref(),
+            Some("/scratch/project data")
+        );
+    }
+
+    #[test]
+    fn completion_accepts_escaped_space_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("project data")).unwrap();
+        std::fs::create_dir(dir.path().join("project notes")).unwrap();
+
+        let local = complete_local_path(dir.path(), r"project\ d").expect("local completion");
+        assert_eq!(local.replacement, Some("project data/".to_string()));
+
+        let entries = vec![
+            Entry {
+                name: "project data".to_string(),
+                is_dir: true,
+                size: None,
+                modified: None,
+            },
+            Entry {
+                name: "project notes".to_string(),
+                is_dir: true,
+                size: None,
+                modified: None,
+            },
+        ];
+        let remote = complete_remote_path("/home/me", "/home/me", &entries, r"project\ d")
+            .expect("remote completion");
+        assert_eq!(remote.replacement, Some("project data/".to_string()));
     }
 
     #[test]

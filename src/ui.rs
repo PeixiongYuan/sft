@@ -314,7 +314,10 @@ fn render_path_prompt(frame: &mut Frame, app: &mut App) {
         ]),
         Line::from(vec![
             Span::raw("Path     "),
-            Span::styled(value.to_string(), accent_style()),
+            Span::styled(
+                truncate_start(value, rect.width.saturating_sub(13) as usize),
+                accent_style(),
+            ),
         ]),
     ];
 
@@ -951,11 +954,13 @@ fn render_file_footer(frame: &mut Frame, message: Option<&str>, file: &FileSessi
         ]),
     ];
 
+    let selected_label = format!("{} selected", selected);
     let status = message.unwrap_or(if selected > 0 { "selection active" } else { "" });
+    let status_width = (area.width as usize).saturating_sub(selected_label.width() + 2);
     lines.push(Line::from(vec![
-        Span::styled(format!("{} selected", selected), accent_warm_style()),
+        Span::styled(selected_label, accent_warm_style()),
         Span::raw("  "),
-        Span::styled(status.to_string(), message_style()),
+        Span::styled(truncate(status, status_width), message_style()),
     ]));
 
     frame.render_widget(Paragraph::new(lines), area);
@@ -1439,4 +1444,32 @@ fn truncate(value: &str, max_width: usize) -> String {
     }
     out.push_str("...");
     out
+}
+
+fn truncate_start(value: &str, max_width: usize) -> String {
+    if value.width() <= max_width {
+        return value.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    if max_width <= 3 {
+        return ".".repeat(max_width);
+    }
+
+    let target = max_width - 3;
+    let mut chars = Vec::new();
+    let mut width = 0;
+    for ch in value.chars().rev() {
+        let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width > target {
+            break;
+        }
+        chars.push(ch);
+        width += ch_width;
+    }
+    chars.reverse();
+
+    let tail = chars.into_iter().collect::<String>();
+    format!("...{tail}")
 }
