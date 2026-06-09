@@ -522,7 +522,9 @@ impl App {
         if !matches!(self.screen, Screen::Files) {
             self.request_host_checks(tx.clone());
         }
-        if let Some(file) = self.file.as_mut() {
+        if let Some(file) = self.file.as_mut()
+            && file.remote_loading
+        {
             file.request_remote_listing(file.remote_path.clone(), tx);
         }
     }
@@ -1244,18 +1246,31 @@ impl App {
             host,
             config_path: Some(self.ssh_config.path.clone()),
         };
-        let remote_home = remote::remote_pwd(&connection).unwrap_or_else(|_| ".".to_string());
-        let remote_path = self
-            .remote_start
-            .clone()
-            .unwrap_or_else(|| remote_home.clone());
-        self.file = Some(FileSession::new(
+        let remote_start = self.remote_start.clone();
+        let initial = remote::fetch_initial_remote_listing(
+            &connection,
+            remote_start.as_deref(),
+            self.show_hidden,
+            SortMode::Name,
+        );
+        let fallback_path = remote_start.unwrap_or_else(|| ".".to_string());
+        let (remote_home, remote_path, remote_entries, remote_error) = match initial {
+            Ok(initial) => (initial.home, initial.path, initial.entries, None),
+            Err(err) => (".".to_string(), fallback_path, Vec::new(), Some(err)),
+        };
+        let mut file = FileSession::new(
             connection,
             self.local_start.clone(),
             remote_path,
             remote_home,
             self.show_hidden,
-        )?);
+        )?;
+        file.remote_entries = remote_entries;
+        file.remote_error = remote_error;
+        file.remote_loading = false;
+        file.remote_state.select(Some(0));
+        self.file = Some(file);
+
         if let Some(file) = self.file.as_ref() {
             self.availability
                 .entry(file.connection.host.clone())

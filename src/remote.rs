@@ -6,8 +6,6 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
-
 use crate::askpass::PasswordHandle;
 use crate::browser::{self, Entry, Pane, SortMode};
 
@@ -32,11 +30,37 @@ pub struct TcpCheckTarget {
     pub via_proxy_jump: Option<String>,
 }
 
-pub fn remote_pwd(connection: &Connection) -> Result<String> {
-    let output = run_sftp_batch(connection, "pwd\n")
-        .map_err(anyhow::Error::msg)
-        .with_context(|| format!("failed to run sftp for {}", connection.host))?;
-    parse_sftp_pwd(&output).context("sftp pwd returned no directory")
+#[derive(Debug, Clone)]
+pub struct InitialRemoteListing {
+    pub home: String,
+    pub path: String,
+    pub entries: Vec<Entry>,
+}
+
+pub fn fetch_initial_remote_listing(
+    connection: &Connection,
+    path: Option<&str>,
+    show_hidden: bool,
+    sort: SortMode,
+) -> Result<InitialRemoteListing, String> {
+    let script = match path {
+        Some(path) => format!("pwd\ncd {}\npwd\nls -lah\n", sftp_quote(path)),
+        None => "pwd\nls -lah\n".to_string(),
+    };
+    let output = run_sftp_batch(connection, &script)?;
+    let pwd = parse_sftp_pwds(&output);
+    let home = pwd.first().cloned().unwrap_or_else(|| ".".to_string());
+    let path = match path {
+        Some(requested) => pwd.get(1).cloned().unwrap_or_else(|| requested.to_string()),
+        None => home.clone(),
+    };
+    let entries = browser::parse_ls_output(&output, show_hidden, sort);
+
+    Ok(InitialRemoteListing {
+        home,
+        path,
+        entries,
+    })
 }
 
 pub fn fetch_remote_listing(
@@ -334,21 +358,26 @@ fn parse_remote_size_output(output: &str) -> Result<u64, String> {
         .map_err(|err| format!("could not parse remote size: {err}"))
 }
 
+#[cfg(test)]
 fn parse_sftp_pwd(output: &str) -> Option<String> {
+    parse_sftp_pwds(output).into_iter().next().or_else(|| {
+        let trimmed = output.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    })
+}
+
+fn parse_sftp_pwds(output: &str) -> Vec<String> {
     output
         .lines()
         .map(str::trim)
-        .find_map(|line| {
+        .filter_map(|line| {
             line.strip_prefix("Remote working directory: ")
                 .or_else(|| line.strip_prefix("Remote working directory:"))
                 .map(str::trim)
                 .filter(|path| !path.is_empty())
                 .map(ToString::to_string)
         })
-        .or_else(|| {
-            let trimmed = output.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
-        })
+        .collect()
 }
 
 fn sftp_quote(value: &str) -> String {
@@ -697,6 +726,16 @@ mod tests {
         assert_eq!(
             parse_sftp_pwd("Remote working directory: /home/deploy\n").as_deref(),
             Some("/home/deploy")
+        );
+    }
+
+    #[test]
+    fn parses_multiple_sftp_pwd_outputs() {
+        assert_eq!(
+            parse_sftp_pwds(
+                "Remote working directory: /home/deploy\nRemote working directory: /scratch/run\n",
+            ),
+            vec!["/home/deploy".to_string(), "/scratch/run".to_string()]
         );
     }
 
