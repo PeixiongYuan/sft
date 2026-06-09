@@ -297,7 +297,6 @@ fn sftp_command(connection: &Connection) -> Command {
     let mut command = Command::new("sftp");
     append_config(&mut command, connection);
     command
-        .arg("-q")
         .arg("-o")
         .arg("ConnectTimeout=10")
         .arg("-o")
