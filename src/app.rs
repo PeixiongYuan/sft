@@ -576,8 +576,7 @@ impl App {
                     }
                 }
                 if let Some(host) = auth_prompt_host {
-                    self.prompt_for_host_auth(host.clone(), Screen::Files, false);
-                    self.message = Some(format!("password required for {host}"));
+                    self.prompt_after_auth_failure(host, Screen::Files, false);
                 }
             }
             AppEvent::PathCompleted {
@@ -633,8 +632,7 @@ impl App {
                     }
                 }
                 if let Some(host) = auth_prompt_host {
-                    self.prompt_for_host_auth(host.clone(), Screen::Files, false);
-                    self.message = Some(format!("password required for {host}"));
+                    self.prompt_after_auth_failure(host, Screen::Files, false);
                 }
             }
             AppEvent::TransferProgress {
@@ -663,8 +661,7 @@ impl App {
                     }
                 }
                 if let Some(host) = auth_prompt_host {
-                    self.prompt_for_host_auth(host.clone(), Screen::Files, false);
-                    self.message = Some(format!("password required for {host}"));
+                    self.prompt_after_auth_failure(host, Screen::Files, false);
                 }
             }
         }
@@ -1254,9 +1251,15 @@ impl App {
             SortMode::Name,
         );
         let fallback_path = remote_start.unwrap_or_else(|| ".".to_string());
+        let mut auth_prompt_host = None;
         let (remote_home, remote_path, remote_entries, remote_error) = match initial {
             Ok(initial) => (initial.home, initial.path, initial.entries, None),
-            Err(err) => (".".to_string(), fallback_path, Vec::new(), Some(err)),
+            Err(err) => {
+                if is_auth_error(&err) {
+                    auth_prompt_host = Some(connection.host.clone());
+                }
+                (".".to_string(), fallback_path, Vec::new(), Some(err))
+            }
         };
         let mut file = FileSession::new(
             connection,
@@ -1280,6 +1283,9 @@ impl App {
         self.record_current_paths();
         self.screen = Screen::Files;
         self.message = None;
+        if let Some(host) = auth_prompt_host {
+            self.prompt_after_auth_failure(host, Screen::Files, false);
+        }
         Ok(())
     }
 
@@ -1311,6 +1317,18 @@ impl App {
         });
         self.screen = Screen::PasswordPrompt;
         self.message = None;
+    }
+
+    fn prompt_after_auth_failure(
+        &mut self,
+        host: String,
+        return_to: Screen,
+        open_after_save: bool,
+    ) {
+        self.passwords.remove(&host);
+        self.set_open_file_password(&host, None);
+        self.prompt_for_host_auth(host.clone(), return_to, open_after_save);
+        self.message = Some(format!("password required for {host}"));
     }
 
     fn apply_auth_prompt(&mut self, prompt: &PasswordPrompt) -> Result<(), String> {
@@ -2710,8 +2728,11 @@ fn is_auth_error(err: &str) -> bool {
     let err = err.to_ascii_lowercase();
     err.contains("permission denied")
         || err.contains("authentication failed")
+        || err.contains("password required")
         || err.contains("read_passphrase")
+        || err.contains("number of password prompts exceeded")
         || err.contains("too many authentication failures")
+        || err.contains("connection closed")
 }
 
 #[cfg(test)]

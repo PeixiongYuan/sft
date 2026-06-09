@@ -2,7 +2,10 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MODE_VAR: &str = "SFT_ASKPASS_MODE";
@@ -16,6 +19,7 @@ pub struct PasswordHandle {
 #[derive(Debug)]
 struct PasswordFile {
     path: PathBuf,
+    consumed: AtomicBool,
 }
 
 impl PasswordHandle {
@@ -37,11 +41,26 @@ impl PasswordHandle {
         file.flush()?;
 
         Ok(Self {
-            inner: Arc::new(PasswordFile { path }),
+            inner: Arc::new(PasswordFile {
+                path,
+                consumed: AtomicBool::new(false),
+            }),
         })
     }
 
+    pub fn is_available(&self) -> bool {
+        !self.inner.consumed.load(Ordering::Relaxed)
+    }
+
+    pub fn mark_consumed(&self) {
+        self.inner.consumed.store(true, Ordering::Relaxed);
+        let _ = fs::remove_file(&self.inner.path);
+    }
+
     pub fn configure_command(&self, command: &mut Command) {
+        if !self.is_available() {
+            return;
+        }
         if let Ok(exe) = std::env::current_exe() {
             command.env("SSH_ASKPASS", exe);
             command.env("SSH_ASKPASS_REQUIRE", "force");
