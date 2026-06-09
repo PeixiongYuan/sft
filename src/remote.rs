@@ -416,9 +416,9 @@ fn append_auth_options(command: &mut Command, connection: &Connection) {
             .arg("-o")
             .arg("KbdInteractiveAuthentication=yes")
             .arg("-o")
-            .arg("NumberOfPasswordPrompts=1")
+            .arg("NumberOfPasswordPrompts=3")
             .arg("-o")
-            .arg("PreferredAuthentications=password,keyboard-interactive,publickey");
+            .arg("PreferredAuthentications=publickey,keyboard-interactive,password");
     } else {
         command
             .arg("-o")
