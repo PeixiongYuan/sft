@@ -10,6 +10,7 @@ use crate::askpass::PasswordHandle;
 use crate::browser::{self, Entry, Pane, SortMode};
 
 const CONTROL_PERSIST_SECS: u32 = 14_400;
+const SSH_OPERATION_CONNECT_TIMEOUT_SECS: u32 = 60;
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const TCP_OVERALL_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -298,7 +299,9 @@ fn sftp_command(connection: &Connection) -> Command {
     append_config(&mut command, connection);
     command
         .arg("-o")
-        .arg("ConnectTimeout=10")
+        .arg(format!(
+            "ConnectTimeout={SSH_OPERATION_CONNECT_TIMEOUT_SECS}"
+        ))
         .arg("-o")
         .arg("ClearAllForwardings=yes");
     append_mux_options(&mut command);
@@ -400,7 +403,9 @@ fn ssh_command(connection: &Connection, remote_command: &str) -> Command {
     append_config(&mut command, connection);
     command
         .arg("-o")
-        .arg("ConnectTimeout=10")
+        .arg(format!(
+            "ConnectTimeout={SSH_OPERATION_CONNECT_TIMEOUT_SECS}"
+        ))
         .arg("-o")
         .arg("ClearAllForwardings=yes");
     append_mux_options(&mut command);
