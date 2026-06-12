@@ -1,9 +1,10 @@
 [package]
 name = "sft"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A focused SSH file transfer TUI."
 license = "MIT"
+repository = "https://github.com/PeixiongYuan/sft"
 keywords = ["ssh", "sftp", "tui", "files"]
 categories = ["command-line-utilities", "development-tools"]
 rust-version = "1.95"
