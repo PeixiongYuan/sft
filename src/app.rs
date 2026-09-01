@@ -1,10 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::Sender;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -16,6 +14,7 @@ use crate::history::{HostHistory, HostStats};
 use crate::path_store::{PathEntry, PathStore};
 use crate::remote::{self, Connection};
 use crate::ssh_config::{HostDraft, SshConfig};
+use crate::transfer;
 
 #[derive(Debug, Clone)]
 pub struct PathCompletion {
@@ -46,6 +45,11 @@ pub enum AppEvent {
         job_id: u64,
         transferred_bytes: u64,
         total_bytes: Option<u64>,
+    },
+    TransferRetrying {
+        job_id: u64,
+        attempt: u32,
+        error: String,
     },
     FileOperationFinished {
         operation: FileOperation,
@@ -130,6 +134,7 @@ pub struct TransferJob {
     pub transferred_bytes: u64,
     pub total_bytes: Option<u64>,
     pub speed_bps: Option<u64>,
+    pub note: Option<String>,
     last_progress_at: Option<i64>,
     last_progress_bytes: u64,
 }
@@ -295,6 +300,12 @@ pub struct CopyPlan {
     pub has_dirs: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct PaneSelection {
+    name: Option<String>,
+    index: usize,
+}
+
 #[derive(Debug)]
 pub struct FileSession {
     pub connection: Connection,
@@ -315,6 +326,7 @@ pub struct FileSession {
     pub local_error: Option<String>,
     pub remote_error: Option<String>,
     pub remote_loading: bool,
+    pub remote_restore_selection: Option<PaneSelection>,
     pub confirm: Option<CopyPlan>,
     pub delete_confirm: Option<DeletePlan>,
     pub transferring: Option<String>,
@@ -352,6 +364,7 @@ impl FileSession {
             local_error: None,
             remote_error: None,
             remote_loading: true,
+            remote_restore_selection: None,
             confirm: None,
             delete_confirm: None,
             transferring: None,
@@ -383,6 +396,7 @@ impl FileSession {
         self.remote_loading = true;
         self.remote_error = None;
         self.remote_selected.clear();
+        self.remote_restore_selection = None;
         self.remote_state.select(Some(0));
 
         let connection = self.connection.clone();
@@ -436,6 +450,44 @@ impl FileSession {
                 self.remote_filter = value;
                 self.remote_state.select(Some(0));
             }
+        }
+    }
+
+    fn clear_filter(&mut self, pane: Pane) {
+        self.set_filter(pane, String::new());
+    }
+
+    fn selection_snapshot(&self, pane: Pane) -> PaneSelection {
+        let (state, entries, filter) = match pane {
+            Pane::Local => (&self.local_state, &self.local_entries, &self.local_filter),
+            Pane::Remote => (&self.remote_state, &self.remote_entries, &self.remote_filter),
+        };
+        let index = state.selected().unwrap_or(0);
+        let name = if index == 0 {
+            None
+        } else {
+            browser::filter_entries(entries, filter)
+                .get(index - 1)
+                .map(|entry| entry.name.clone())
+        };
+        PaneSelection { name, index }
+    }
+
+    fn restore_selection(&mut self, pane: Pane, snapshot: PaneSelection) {
+        let (entries, filter) = match pane {
+            Pane::Local => (&self.local_entries, &self.local_filter),
+            Pane::Remote => (&self.remote_entries, &self.remote_filter),
+        };
+        let filtered = browser::filter_entries(entries, filter);
+        let index = snapshot
+            .name
+            .as_deref()
+            .and_then(|name| filtered.iter().position(|entry| entry.name == name))
+            .map(|pos| pos + 1)
+            .unwrap_or_else(|| snapshot.index.min(filtered.len()));
+        match pane {
+            Pane::Local => self.local_state.select(Some(index)),
+            Pane::Remote => self.remote_state.select(Some(index)),
         }
     }
 }
@@ -565,12 +617,16 @@ impl App {
                             .or_insert(HostAvailability::Reachable { rtt_ms: 0 });
                         file.remote_entries = entries;
                         file.remote_error = None;
-                        file.remote_state.select(Some(0));
+                        match file.remote_restore_selection.take() {
+                            Some(snapshot) => file.restore_selection(Pane::Remote, snapshot),
+                            None => file.remote_state.select(Some(0)),
+                        }
                     }
                     Err(err) => {
                         if is_auth_error(&err) {
                             auth_prompt_host = Some(file.connection.host.clone());
                         }
+                        file.remote_restore_selection = None;
                         file.remote_entries.clear();
                         file.remote_error = Some(err);
                     }
@@ -642,6 +698,16 @@ impl App {
             } => {
                 self.update_transfer_progress(job_id, transferred_bytes, total_bytes);
             }
+            AppEvent::TransferRetrying {
+                job_id,
+                attempt,
+                error,
+            } => {
+                if let Some(job) = self.transfer_jobs.iter_mut().find(|job| job.id == job_id) {
+                    job.note = Some(format!("reconnecting (attempt {attempt}): {error}"));
+                    job.speed_bps = None;
+                }
+            }
             AppEvent::FileOperationFinished { operation, result } => {
                 let mut auth_prompt_host = None;
                 if let Some(file) = self.file.as_mut() {
@@ -672,8 +738,12 @@ impl App {
         let Some(file) = self.file.as_mut() else {
             return Ok(());
         };
+        let local_selection = file.selection_snapshot(Pane::Local);
+        let remote_selection = file.selection_snapshot(Pane::Remote);
         file.refresh_local()?;
+        file.restore_selection(Pane::Local, local_selection);
         file.request_remote_listing(file.remote_path.clone(), tx);
+        file.remote_restore_selection = Some(remote_selection);
         self.message = Some("refreshed local and remote".to_string());
         Ok(())
     }
@@ -1409,6 +1479,7 @@ impl App {
             Pane::Local => {
                 let path = resolve_local_jump_path(&file.local_path, input)?;
                 file.local_path = path;
+                file.clear_filter(Pane::Local);
                 file.refresh_local()
                     .map_err(|err| format!("could not read local directory: {err}"))?;
                 self.message = Some(format!("local path: {}", file.local_path.display()));
@@ -1416,6 +1487,7 @@ impl App {
             Pane::Remote => {
                 let path = resolve_remote_jump_path(&file.remote_path, &file.remote_home, input)
                     .ok_or_else(|| "remote directory is required".to_string())?;
+                file.clear_filter(Pane::Remote);
                 file.request_remote_listing(path.clone(), tx);
                 self.message = Some(format!("remote path: {path}"));
             }
@@ -1586,6 +1658,7 @@ impl App {
     fn finish_transfer_job(&mut self, job_id: u64, result: &Result<(), String>) {
         if let Some(job) = self.transfer_jobs.iter_mut().find(|job| job.id == job_id) {
             job.finished_at = Some(now_epoch());
+            job.note = None;
             match result {
                 Ok(()) => {
                     job.status = TransferJobStatus::Succeeded;
@@ -1618,6 +1691,7 @@ impl App {
         if total_bytes.is_some() {
             job.total_bytes = total_bytes;
         }
+        job.note = None;
 
         let transferred_bytes = transferred_bytes.max(job.transferred_bytes);
         let now = now_millis();
@@ -1938,6 +2012,7 @@ impl App {
             transferred_bytes: 0,
             total_bytes: transfer_source_total(file, &plan),
             speed_bps: None,
+            note: None,
             last_progress_at: None,
             last_progress_bytes: 0,
         };
@@ -1953,30 +2028,36 @@ impl App {
         let local_path = file.local_path.clone();
         let remote_path = file.remote_path.clone();
         let names = plan.names.clone();
-        let has_dirs = plan.has_dirs;
-        let progress_plan = TransferProgressPlan {
-            connection: connection.clone(),
-            direction,
-            local_path: local_path.clone(),
-            remote_path: remote_path.clone(),
-            names: names.clone(),
-            total_bytes: job.total_bytes,
-            baseline_bytes: transfer_target_baseline(file, direction, &names),
-        };
-        let progress_done = Arc::new(AtomicBool::new(false));
-        let transfer_done = Arc::clone(&progress_done);
-        spawn_transfer_progress_watcher(job_id, progress_plan, tx.clone(), progress_done);
         self.push_transfer_job(job);
+        let progress_tx = tx.clone();
         thread::spawn(move || {
-            let result = remote::run_sftp_transfer(
+            let result = transfer::run_transfer(
                 &connection,
                 source,
                 &local_path,
                 &remote_path,
                 &names,
-                has_dirs,
+                |update| {
+                    let event = match update {
+                        transfer::TransferUpdate::Progress {
+                            transferred_bytes,
+                            total_bytes,
+                        } => AppEvent::TransferProgress {
+                            job_id,
+                            transferred_bytes,
+                            total_bytes,
+                        },
+                        transfer::TransferUpdate::Retrying { attempt, error } => {
+                            AppEvent::TransferRetrying {
+                                job_id,
+                                attempt,
+                                error,
+                            }
+                        }
+                    };
+                    let _ = progress_tx.send(event);
+                },
             );
-            transfer_done.store(true, Ordering::Relaxed);
             let _ = tx.send(AppEvent::TransferFinished { job_id, result });
         });
     }
@@ -2008,6 +2089,7 @@ impl App {
                 };
                 if entry.is_dir {
                     file.local_path = file.local_path.join(entry.name);
+                    file.clear_filter(Pane::Local);
                     let _ = file.refresh_local();
                     self.record_path(Pane::Local);
                 } else {
@@ -2025,6 +2107,7 @@ impl App {
                 };
                 if entry.is_dir {
                     let new_path = browser::join_remote_path(&file.remote_path, &entry.name);
+                    file.clear_filter(Pane::Remote);
                     file.request_remote_listing(new_path, tx);
                     self.record_path(Pane::Remote);
                 } else {
@@ -2046,6 +2129,7 @@ impl App {
             Pane::Local => {
                 if let Some(parent) = file.local_path.parent() {
                     file.local_path = parent.to_path_buf();
+                    file.clear_filter(Pane::Local);
                     let _ = file.refresh_local();
                     self.record_path(Pane::Local);
                 }
@@ -2056,6 +2140,7 @@ impl App {
                 }
                 let parent = browser::parent_remote_path(&file.remote_path);
                 if parent != file.remote_path {
+                    file.clear_filter(Pane::Remote);
                     file.request_remote_listing(parent, tx);
                     self.record_path(Pane::Remote);
                 }
@@ -2274,97 +2359,6 @@ fn delete_local_entries(base: &Path, names: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-struct TransferProgressPlan {
-    connection: Connection,
-    direction: TransferDirection,
-    local_path: PathBuf,
-    remote_path: String,
-    names: Vec<String>,
-    total_bytes: Option<u64>,
-    baseline_bytes: u64,
-}
-
-impl TransferProgressPlan {
-    fn source_total_bytes(&self) -> Option<u64> {
-        match self.direction {
-            TransferDirection::Upload => local_entries_size(&self.local_path, &self.names).ok(),
-            TransferDirection::Download => {
-                remote::remote_entries_size(&self.connection, &self.remote_path, &self.names).ok()
-            }
-        }
-    }
-
-    fn target_bytes(&self) -> Option<u64> {
-        match self.direction {
-            TransferDirection::Upload => {
-                remote::remote_entries_size(&self.connection, &self.remote_path, &self.names).ok()
-            }
-            TransferDirection::Download => local_entries_size(&self.local_path, &self.names).ok(),
-        }
-    }
-
-    fn transferred_bytes(&self) -> Option<u64> {
-        self.target_bytes()
-            .map(|bytes| bytes.saturating_sub(self.baseline_bytes))
-    }
-}
-
-fn spawn_transfer_progress_watcher(
-    job_id: u64,
-    plan: TransferProgressPlan,
-    tx: Sender<AppEvent>,
-    done: Arc<AtomicBool>,
-) {
-    thread::spawn(move || {
-        let mut total_bytes = plan.total_bytes;
-        let mut total_rx = if total_bytes.is_none() {
-            let total_plan = plan.clone();
-            let (total_tx, total_rx) = mpsc::channel();
-            thread::spawn(move || {
-                let _ = total_tx.send(total_plan.source_total_bytes());
-            });
-            Some(total_rx)
-        } else {
-            None
-        };
-
-        loop {
-            if total_bytes.is_none()
-                && let Some(rx) = &total_rx
-            {
-                match rx.try_recv() {
-                    Ok(Some(total)) => {
-                        total_bytes = Some(total);
-                        total_rx = None;
-                    }
-                    Ok(None) | Err(mpsc::TryRecvError::Disconnected) => {
-                        total_rx = None;
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {}
-                }
-            }
-
-            if let Some(transferred_bytes) = plan.transferred_bytes() {
-                let transferred_bytes = total_bytes
-                    .map(|total| transferred_bytes.min(total))
-                    .unwrap_or(transferred_bytes);
-                let _ = tx.send(AppEvent::TransferProgress {
-                    job_id,
-                    transferred_bytes,
-                    total_bytes,
-                });
-            }
-
-            if done.load(Ordering::Relaxed) {
-                break;
-            }
-
-            thread::sleep(Duration::from_millis(700));
-        }
-    });
-}
-
 fn transfer_source_total(file: &FileSession, plan: &CopyPlan) -> Option<u64> {
     if plan.has_dirs {
         return None;
@@ -2377,18 +2371,6 @@ fn transfer_source_total(file: &FileSession, plan: &CopyPlan) -> Option<u64> {
     listed_entries_size(entries, &plan.names)
 }
 
-fn transfer_target_baseline(
-    file: &FileSession,
-    direction: TransferDirection,
-    names: &[String],
-) -> u64 {
-    let entries = match direction {
-        TransferDirection::Upload => &file.remote_entries,
-        TransferDirection::Download => &file.local_entries,
-    };
-    listed_existing_file_size(entries, names)
-}
-
 fn listed_entries_size(entries: &[Entry], names: &[String]) -> Option<u64> {
     names.iter().try_fold(0u64, |total, name| {
         let entry = entries.iter().find(|entry| entry.name == *name)?;
@@ -2397,42 +2379,6 @@ fn listed_entries_size(entries: &[Entry], names: &[String]) -> Option<u64> {
         }
         entry.size.map(|size| total.saturating_add(size))
     })
-}
-
-fn listed_existing_file_size(entries: &[Entry], names: &[String]) -> u64 {
-    names
-        .iter()
-        .filter_map(|name| entries.iter().find(|entry| entry.name == *name))
-        .filter(|entry| !entry.is_dir)
-        .filter_map(|entry| entry.size)
-        .fold(0u64, u64::saturating_add)
-}
-
-fn local_entries_size(base: &Path, names: &[String]) -> Result<u64, String> {
-    names.iter().try_fold(0u64, |total, name| {
-        local_path_size(&base.join(name)).map(|size| total.saturating_add(size))
-    })
-}
-
-fn local_path_size(path: &Path) -> Result<u64, String> {
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|err| format!("could not inspect {}: {err}", path.display()))?;
-    let file_type = metadata.file_type();
-    if file_type.is_file() {
-        return Ok(metadata.len());
-    }
-    if !file_type.is_dir() {
-        return Ok(0);
-    }
-
-    let mut total = 0u64;
-    let entries = std::fs::read_dir(path)
-        .map_err(|err| format!("could not read directory {}: {err}", path.display()))?;
-    for entry in entries {
-        let entry = entry.map_err(|err| format!("could not read directory entry: {err}"))?;
-        total = total.saturating_add(local_path_size(&entry.path())?);
-    }
-    Ok(total)
 }
 
 fn validate_entry_name(input: &str) -> Result<String, String> {
@@ -2822,21 +2768,5 @@ mod tests {
         assert!(validate_entry_name("").is_err());
         assert!(validate_entry_name("../logs").is_err());
         assert!(validate_entry_name(".").is_err());
-    }
-
-    #[test]
-    fn local_entries_size_counts_nested_files() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("top.bin"), b"abc").unwrap();
-        std::fs::create_dir(dir.path().join("nested")).unwrap();
-        std::fs::write(dir.path().join("nested").join("child.bin"), b"12345").unwrap();
-
-        let size = local_entries_size(
-            dir.path(),
-            &[String::from("top.bin"), String::from("nested")],
-        )
-        .unwrap();
-
-        assert_eq!(size, 8);
     }
 }

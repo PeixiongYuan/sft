@@ -538,11 +538,14 @@ fn render_transfer_jobs(frame: &mut Frame, app: &mut App) {
             };
             let detail = match job.status {
                 TransferJobStatus::Failed => job.error.as_deref().unwrap_or("failed").to_string(),
-                _ => format!(
-                    "{} -> {}",
-                    truncate(&job.local_path, 20),
-                    truncate(&job.remote_path, 20)
-                ),
+                _ => match &job.note {
+                    Some(note) => note.clone(),
+                    None => format!(
+                        "{} -> {}",
+                        truncate(&job.local_path, 20),
+                        truncate(&job.remote_path, 20)
+                    ),
+                },
             };
             ListItem::new(vec![
                 Line::from(vec![
@@ -1059,6 +1062,15 @@ fn render_transfer(frame: &mut Frame, label: &str, job: Option<&TransferJob>, ar
             job,
             rect.width.saturating_sub(6) as usize,
         ));
+        if let Some(note) = &job.note {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    truncate(note, rect.width.saturating_sub(6) as usize),
+                    danger_style(),
+                ),
+            ]));
+        }
     } else {
         lines.push(Line::from(vec![
             Span::raw("  "),

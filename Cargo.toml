@@ -11,10 +11,14 @@ rust-version = "1.95"
 
 [dependencies]
 anyhow = "1"
+bytes = "1.12.1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
 dirs = "6"
+futures-core = "0.3.34"
+openssh-sftp-client = "0.15.8"
 ratatui = "0.30"
+tokio = { version = "1.53.1", features = ["rt", "process", "io-util", "time", "fs", "macros"] }
 unicode-width = "0.2"
 
 [dev-dependencies]

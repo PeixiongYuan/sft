@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::askpass::PasswordHandle;
-use crate::browser::{self, Entry, Pane, SortMode};
+use crate::browser::{self, Entry, SortMode};
 
 const CONTROL_PERSIST_SECS: u32 = 14_400;
 const SSH_OPERATION_CONNECT_TIMEOUT_SECS: u32 = 60;
@@ -91,18 +91,6 @@ pub fn fetch_remote_directories(
     Ok(dirs)
 }
 
-pub fn run_sftp_transfer(
-    connection: &Connection,
-    source: Pane,
-    local_path: &Path,
-    remote_path: &str,
-    names: &[String],
-    has_dirs: bool,
-) -> Result<(), String> {
-    let script = build_sftp_transfer_batch(source, local_path, remote_path, names, has_dirs);
-    run_sftp_batch(connection, &script).map(|_| ())
-}
-
 pub fn create_remote_dir(connection: &Connection, path: &str, name: &str) -> Result<(), String> {
     let target = browser::join_remote_path(path, name);
     run_sftp_batch(connection, &format!("mkdir {}\n", sftp_quote(&target))).map(|_| ())
@@ -151,42 +139,6 @@ pub fn delete_remote_entries(
     run_remote_shell(connection, &format!("rm -rf -- {targets}"))
 }
 
-pub fn remote_entries_size(
-    connection: &Connection,
-    path: &str,
-    names: &[String],
-) -> Result<u64, String> {
-    if names.is_empty() {
-        return Ok(0);
-    }
-
-    let targets = names
-        .iter()
-        .map(|name| browser::shell_escape(&browser::join_remote_path(path, name)))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let command = format!(
-        r#"sft_size() {{
-    if [ -f "$1" ]; then
-        stat -c %s -- "$1" 2>/dev/null || stat -f %z "$1" 2>/dev/null || wc -c < "$1" 2>/dev/null || printf 0
-    elif [ -d "$1" ]; then
-        find "$1" -type f -exec sh -c 'for f do stat -c %s -- "$f" 2>/dev/null || stat -f %z "$f" 2>/dev/null || wc -c < "$f" 2>/dev/null || printf 0; done' sh {{}} + 2>/dev/null | awk '{{s += $1}} END {{print s+0}}'
-    else
-        printf 0
-    fi
-}}
-total=0
-for p in {targets}; do
-    size=$(sft_size "$p")
-    total=$((total + size))
-done
-printf '%s\n' "$total"
-"#
-    );
-    let output = run_remote_shell_output(connection, &command)?;
-    parse_remote_size_output(&output)
-}
-
 pub fn check_reachability(host: &str, config_path: Option<&Path>) -> Option<u32> {
     let target = resolve_tcp_check_target(host, config_path);
     tcp_connect_rtt(&target.hostname, target.port)
@@ -223,45 +175,6 @@ pub fn resolve_tcp_check_target(host: &str, config_path: Option<&Path>) -> TcpCh
         port,
         via_proxy_jump: Some(jump.host),
     }
-}
-
-fn build_sftp_transfer_batch(
-    source: Pane,
-    local_path: &Path,
-    remote_path: &str,
-    names: &[String],
-    has_dirs: bool,
-) -> String {
-    let recursive = if has_dirs { "R" } else { "" };
-    let flags = format!("-p{recursive}");
-    let mut script = String::new();
-
-    match source {
-        Pane::Local => {
-            let remote_dir = browser::ensure_remote_dir(remote_path);
-            for name in names {
-                let local = local_path.join(name).to_string_lossy().into_owned();
-                script.push_str(&format!(
-                    "put {flags} {} {}\n",
-                    sftp_quote(&local),
-                    sftp_quote(&remote_dir)
-                ));
-            }
-        }
-        Pane::Remote => {
-            let local_dir = local_path.to_string_lossy().into_owned();
-            for name in names {
-                let remote = browser::join_remote_path(remote_path, name);
-                script.push_str(&format!(
-                    "get {flags} {} {}\n",
-                    sftp_quote(&remote),
-                    sftp_quote(&local_dir)
-                ));
-            }
-        }
-    }
-
-    script
 }
 
 fn run_sftp_batch(connection: &Connection, script: &str) -> Result<String, String> {
@@ -315,6 +228,25 @@ fn sftp_command(connection: &Connection) -> Command {
     command
 }
 
+/// Build an `ssh` command that opens the raw SFTP subsystem channel on the
+/// (reused) connection, with stdin/stdout speaking the SFTP wire protocol.
+pub fn ssh_sftp_subsystem_command(connection: &Connection) -> Command {
+    let mut command = Command::new("ssh");
+    append_config(&mut command, connection);
+    append_proxy_jump_mux_options(&mut command, connection);
+    command
+        .arg("-o")
+        .arg(format!(
+            "ConnectTimeout={SSH_OPERATION_CONNECT_TIMEOUT_SECS}"
+        ))
+        .arg("-o")
+        .arg("ClearAllForwardings=yes");
+    append_mux_options(&mut command, connection);
+    append_auth_options(&mut command, connection);
+    command.arg("-s").arg("--").arg(&connection.host).arg("sftp");
+    command
+}
+
 fn run_remote_shell(connection: &Connection, remote_command: &str) -> Result<(), String> {
     ensure_connection_master(connection)?;
 
@@ -331,42 +263,6 @@ fn run_remote_shell(connection: &Connection, remote_command: &str) -> Result<(),
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(useful_error(&stderr, output.status.code()))
     }
-}
-
-fn run_remote_shell_output(
-    connection: &Connection,
-    remote_command: &str,
-) -> Result<String, String> {
-    ensure_connection_master(connection)?;
-
-    let output = ssh_command(connection, remote_command)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|err| format!("failed to spawn ssh: {err}"))?;
-
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        Err(useful_error(
-            &format!("{stderr}\n{stdout}"),
-            output.status.code(),
-        ))
-    }
-}
-
-fn parse_remote_size_output(output: &str) -> Result<u64, String> {
-    output
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .ok_or_else(|| "remote size command returned no output".to_string())?
-        .parse::<u64>()
-        .map_err(|err| format!("could not parse remote size: {err}"))
 }
 
 #[cfg(test)]
@@ -451,7 +347,7 @@ fn append_mux_options(command: &mut Command, connection: &Connection) {
     }
 }
 
-fn ensure_connection_master(connection: &Connection) -> Result<(), String> {
+pub fn ensure_connection_master(connection: &Connection) -> Result<(), String> {
     ensure_proxy_jump_master(connection)?;
 
     let Some(control_path) = connection_control_path(connection) else {
@@ -558,7 +454,11 @@ fn ensure_proxy_jump_master(connection: &Connection) -> Result<(), String> {
         .arg("-o")
         .arg(format!("ControlPersist={CONTROL_PERSIST_SECS}"))
         .arg("-o")
-        .arg(format!("ControlPath={}", jump.control_path));
+        .arg(format!("ControlPath={}", jump.control_path))
+        .arg("-o")
+        .arg("ServerAliveInterval=30")
+        .arg("-o")
+        .arg("ServerAliveCountMax=3");
     append_auth_options(&mut command, connection);
     append_proxy_jump_target_args(&mut command, &jump.target);
 
@@ -952,8 +852,10 @@ fn mux_base_dir() -> Option<PathBuf> {
     Some(base)
 }
 
-fn useful_error(stderr: &str, code: Option<i32>) -> String {
-    let filtered = stderr
+/// Drop the noise OpenSSH prints on stderr (banners, warnings) and keep the
+/// lines that actually explain a failure.
+pub fn filter_ssh_stderr(stderr: &str) -> String {
+    stderr
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
@@ -963,8 +865,11 @@ fn useful_error(stderr: &str, code: Option<i32>) -> String {
         .filter(|line| !line.starts_with("** The server"))
         .filter(|line| !line.starts_with("Connection to "))
         .collect::<Vec<_>>()
-        .join("\n");
+        .join("\n")
+}
 
+fn useful_error(stderr: &str, code: Option<i32>) -> String {
+    let filtered = filter_ssh_stderr(stderr);
     if filtered.is_empty() {
         format!("command failed with exit code {}", code.unwrap_or(1))
     } else {
@@ -1037,32 +942,26 @@ mod tests {
     }
 
     #[test]
-    fn builds_sftp_upload_batch() {
-        let batch = build_sftp_transfer_batch(
-            Pane::Local,
-            Path::new("/tmp/local"),
-            "/var/www",
-            &[String::from("app bundle.tar")],
-            false,
-        );
+    fn builds_sftp_subsystem_command() {
+        let connection = Connection {
+            host: "web".to_string(),
+            config_path: None,
+            password: None,
+        };
 
+        let command = ssh_sftp_subsystem_command(&connection);
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(command.get_program(), "ssh");
         assert_eq!(
-            batch,
-            "put -p \"/tmp/local/app bundle.tar\" \"/var/www/\"\n"
+            &args[args.len() - 4..],
+            ["-s", "--", "web", "sftp"],
+            "subsystem invocation should end with -s -- <host> sftp"
         );
-    }
-
-    #[test]
-    fn builds_sftp_recursive_download_batch() {
-        let batch = build_sftp_transfer_batch(
-            Pane::Remote,
-            Path::new("/tmp/local"),
-            "/var/www",
-            &[String::from("assets")],
-            true,
-        );
-
-        assert_eq!(batch, "get -pR \"/var/www/assets\" \"/tmp/local\"\n");
+        assert!(args.iter().any(|arg| arg == "BatchMode=yes"));
     }
 
     #[test]
@@ -1091,8 +990,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parses_remote_size_output_from_last_line() {
-        assert_eq!(parse_remote_size_output("debug\n42\n").unwrap(), 42);
-    }
 }

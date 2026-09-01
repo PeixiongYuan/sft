@@ -215,14 +215,6 @@ pub fn join_remote_path(base: &str, name: &str) -> String {
     }
 }
 
-pub fn ensure_remote_dir(path: &str) -> String {
-    if path.ends_with('/') {
-        path.to_string()
-    } else {
-        format!("{path}/")
-    }
-}
-
 pub fn shell_escape(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }

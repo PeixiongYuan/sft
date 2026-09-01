@@ -5,6 +5,7 @@ mod history;
 mod path_store;
 mod remote;
 mod ssh_config;
+mod transfer;
 mod tui;
 mod ui;
 
