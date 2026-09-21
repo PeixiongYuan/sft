@@ -4,6 +4,7 @@ mod browser;
 mod history;
 mod path_store;
 mod remote;
+mod session;
 mod ssh_config;
 mod transfer;
 mod tui;

@@ -1,6 +1,5 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::io::Write;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -10,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::askpass::PasswordHandle;
 use crate::browser::{self, Entry, SortMode};
+use crate::session;
 
 const CONTROL_PERSIST_SECS: u32 = 14_400;
 const SSH_OPERATION_CONNECT_TIMEOUT_SECS: u32 = 60;
@@ -18,6 +18,25 @@ const TCP_OVERALL_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub const DEFAULT_SSH_PORT: u16 = 22;
 pub const SLOW_REACHABILITY_MS: u32 = 500;
+
+/// How long to wait for a host to answer the SFTP subsystem handshake.
+///
+/// This is a backstop for a channel that never comes up, not a latency
+/// budget: ssh already bounds connecting and keeps the link alive, while the
+/// server can spend a long time on per-session setup (PAM, directory
+/// services, mounting a network home) before the subsystem replies. Busy
+/// login nodes routinely take tens of seconds, so keep this well clear of
+/// what a healthy-but-slow host needs.
+pub const SFTP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Says how long was waited, so a timeout reads as "this host is unusually
+/// slow" rather than "sft gave up for no stated reason".
+pub fn handshake_timeout_message() -> String {
+    format!(
+        "host did not open an sftp session within {}s",
+        SFTP_HANDSHAKE_TIMEOUT.as_secs()
+    )
+}
 
 #[derive(Debug, Clone)]
 pub struct Connection {
@@ -46,18 +65,12 @@ pub fn fetch_initial_remote_listing(
     show_hidden: bool,
     sort: SortMode,
 ) -> Result<InitialRemoteListing, String> {
-    let script = match path {
-        Some(path) => format!("pwd\ncd {}\npwd\nls -lah\n", sftp_quote(path)),
-        None => "pwd\nls -lah\n".to_string(),
-    };
-    let output = run_sftp_batch(connection, &script)?;
-    let pwd = parse_sftp_pwds(&output);
-    let home = pwd.first().cloned().unwrap_or_else(|| ".".to_string());
+    let home = session::realpath(connection, ".")?;
     let path = match path {
-        Some(requested) => pwd.get(1).cloned().unwrap_or_else(|| requested.to_string()),
+        Some(requested) => session::realpath(connection, requested)?,
         None => home.clone(),
     };
-    let entries = browser::parse_ls_output(&output, show_hidden, sort);
+    let entries = session::list_entries(connection, &path, show_hidden, sort)?;
 
     Ok(InitialRemoteListing {
         home,
@@ -72,9 +85,7 @@ pub fn fetch_remote_listing(
     show_hidden: bool,
     sort: SortMode,
 ) -> Result<Vec<Entry>, String> {
-    let script = format!("cd {}\nls -lah\n", sftp_quote(path));
-    let output = run_sftp_batch(connection, &script)?;
-    Ok(browser::parse_ls_output(&output, show_hidden, sort))
+    session::list_entries(connection, path, show_hidden, sort)
 }
 
 pub fn fetch_remote_directories(
@@ -92,8 +103,7 @@ pub fn fetch_remote_directories(
 }
 
 pub fn create_remote_dir(connection: &Connection, path: &str, name: &str) -> Result<(), String> {
-    let target = browser::join_remote_path(path, name);
-    run_sftp_batch(connection, &format!("mkdir {}\n", sftp_quote(&target))).map(|_| ())
+    session::create_dir(connection, &browser::join_remote_path(path, name))
 }
 
 pub fn rename_remote_entry(
@@ -104,39 +114,27 @@ pub fn rename_remote_entry(
 ) -> Result<(), String> {
     let source = browser::join_remote_path(path, old_name);
     let target = browser::join_remote_path(path, new_name);
-    run_sftp_batch(
-        connection,
-        &format!("rename {} {}\n", sftp_quote(&source), sftp_quote(&target)),
-    )
-    .map(|_| ())
+    session::rename(connection, &source, &target)
 }
 
 pub fn delete_remote_entries(
     connection: &Connection,
     path: &str,
     names: &[String],
-    has_dirs: bool,
 ) -> Result<(), String> {
     if names.is_empty() {
         return Ok(());
     }
-    if !has_dirs {
-        let script = names
-            .iter()
-            .map(|name| {
-                let target = browser::join_remote_path(path, name);
-                format!("rm {}\n", sftp_quote(&target))
-            })
-            .collect::<String>();
-        return run_sftp_batch(connection, &script).map(|_| ());
-    }
-
     let targets = names
         .iter()
-        .map(|name| browser::shell_escape(&browser::join_remote_path(path, name)))
-        .collect::<Vec<_>>()
-        .join(" ");
-    run_remote_shell(connection, &format!("rm -rf -- {targets}"))
+        .map(|name| browser::join_remote_path(path, name))
+        .collect::<Vec<_>>();
+    session::remove(connection, targets)
+}
+
+/// Close this host's control session, e.g. when leaving its file browser.
+pub fn close_session(connection: &Connection) {
+    session::shutdown(connection);
 }
 
 pub fn check_reachability(host: &str, config_path: Option<&Path>) -> Option<u32> {
@@ -177,57 +175,6 @@ pub fn resolve_tcp_check_target(host: &str, config_path: Option<&Path>) -> TcpCh
     }
 }
 
-fn run_sftp_batch(connection: &Connection, script: &str) -> Result<String, String> {
-    ensure_connection_master(connection)?;
-
-    let mut command = sftp_command(connection);
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("failed to spawn sftp: {err}"))?;
-
-    let Some(mut stdin) = child.stdin.take() else {
-        return Err("failed to open sftp stdin".to_string());
-    };
-    stdin
-        .write_all(script.as_bytes())
-        .map_err(|err| format!("failed to write sftp batch: {err}"))?;
-    drop(stdin);
-
-    let output = child
-        .wait_with_output()
-        .map_err(|err| format!("failed to wait for sftp: {err}"))?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        Err(useful_error(
-            &format!("{stderr}\n{stdout}"),
-            output.status.code(),
-        ))
-    }
-}
-
-fn sftp_command(connection: &Connection) -> Command {
-    let mut command = Command::new("sftp");
-    append_config(&mut command, connection);
-    append_proxy_jump_mux_options(&mut command, connection);
-    command
-        .arg("-o")
-        .arg(format!(
-            "ConnectTimeout={SSH_OPERATION_CONNECT_TIMEOUT_SECS}"
-        ))
-        .arg("-o")
-        .arg("ClearAllForwardings=yes");
-    append_mux_options(&mut command, connection);
-    append_auth_options(&mut command, connection);
-    command.arg("-b").arg("-").arg(&connection.host);
-    command
-}
-
 /// Build an `ssh` command that opens the raw SFTP subsystem channel on the
 /// (reused) connection, with stdin/stdout speaking the SFTP wire protocol.
 pub fn ssh_sftp_subsystem_command(connection: &Connection) -> Command {
@@ -244,79 +191,6 @@ pub fn ssh_sftp_subsystem_command(connection: &Connection) -> Command {
     append_mux_options(&mut command, connection);
     append_auth_options(&mut command, connection);
     command.arg("-s").arg("--").arg(&connection.host).arg("sftp");
-    command
-}
-
-fn run_remote_shell(connection: &Connection, remote_command: &str) -> Result<(), String> {
-    ensure_connection_master(connection)?;
-
-    let output = ssh_command(connection, remote_command)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|err| format!("failed to spawn ssh: {err}"))?;
-
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(useful_error(&stderr, output.status.code()))
-    }
-}
-
-#[cfg(test)]
-fn parse_sftp_pwd(output: &str) -> Option<String> {
-    parse_sftp_pwds(output).into_iter().next().or_else(|| {
-        let trimmed = output.trim();
-        (!trimmed.is_empty()).then(|| trimmed.to_string())
-    })
-}
-
-fn parse_sftp_pwds(output: &str) -> Vec<String> {
-    output
-        .lines()
-        .map(str::trim)
-        .filter_map(|line| {
-            line.strip_prefix("Remote working directory: ")
-                .or_else(|| line.strip_prefix("Remote working directory:"))
-                .map(str::trim)
-                .filter(|path| !path.is_empty())
-                .map(ToString::to_string)
-        })
-        .collect()
-}
-
-fn sftp_quote(value: &str) -> String {
-    let mut out = String::from("\"");
-    for ch in value.chars() {
-        match ch {
-            '\\' | '"' => {
-                out.push('\\');
-                out.push(ch);
-            }
-            '\n' | '\r' => out.push(' '),
-            _ => out.push(ch),
-        }
-    }
-    out.push('"');
-    out
-}
-
-fn ssh_command(connection: &Connection, remote_command: &str) -> Command {
-    let mut command = Command::new("ssh");
-    append_config(&mut command, connection);
-    append_proxy_jump_mux_options(&mut command, connection);
-    command
-        .arg("-o")
-        .arg(format!(
-            "ConnectTimeout={SSH_OPERATION_CONNECT_TIMEOUT_SECS}"
-        ))
-        .arg("-o")
-        .arg("ClearAllForwardings=yes");
-    append_mux_options(&mut command, connection);
-    append_auth_options(&mut command, connection);
-    command.arg("--").arg(&connection.host).arg(remote_command);
     command
 }
 
@@ -882,6 +756,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn handshake_timeout_tolerates_slow_session_setup() {
+        // Busy login nodes have been measured needing well over 30s to
+        // answer the subsystem. A tight timeout here makes healthy transfers
+        // abandon a connection that was about to come up and reconnect for
+        // nothing, so keep plenty of headroom.
+        assert!(SFTP_HANDSHAKE_TIMEOUT >= Duration::from_secs(90));
+        assert!(handshake_timeout_message().contains("120s"));
+    }
+
+    #[test]
     fn parses_effective_ssh_output() {
         let parsed = parse_effective_ssh(
             "user deploy\nhostname 10.0.0.4\nport 2222\nproxyjump bastion\n",
@@ -962,32 +846,6 @@ mod tests {
             "subsystem invocation should end with -s -- <host> sftp"
         );
         assert!(args.iter().any(|arg| arg == "BatchMode=yes"));
-    }
-
-    #[test]
-    fn quotes_sftp_paths() {
-        assert_eq!(
-            sftp_quote(r#"/tmp/a "quote" dir"#),
-            r#""/tmp/a \"quote\" dir""#
-        );
-    }
-
-    #[test]
-    fn parses_sftp_pwd_output() {
-        assert_eq!(
-            parse_sftp_pwd("Remote working directory: /home/deploy\n").as_deref(),
-            Some("/home/deploy")
-        );
-    }
-
-    #[test]
-    fn parses_multiple_sftp_pwd_outputs() {
-        assert_eq!(
-            parse_sftp_pwds(
-                "Remote working directory: /home/deploy\nRemote working directory: /scratch/run\n",
-            ),
-            vec!["/home/deploy".to_string(), "/scratch/run".to_string()]
-        );
     }
 
 }

@@ -114,76 +114,6 @@ pub fn filter_entries(entries: &[Entry], query: &str) -> Vec<Entry> {
         .collect()
 }
 
-pub fn parse_ls_output(output: &str, show_hidden: bool, sort: SortMode) -> Vec<Entry> {
-    let mut entries = Vec::new();
-    for line in output.lines() {
-        if let Some(entry) = parse_long_listing_line(line, show_hidden) {
-            entries.push(entry);
-        }
-    }
-    sort_entries(&mut entries, sort);
-    entries
-}
-
-fn parse_long_listing_line(line: &str, show_hidden: bool) -> Option<Entry> {
-    let line = line.trim();
-    if line.is_empty() || line.starts_with("total ") {
-        return None;
-    }
-
-    let mut parts = Vec::with_capacity(9);
-    let mut rest = line;
-    for _ in 0..8 {
-        rest = rest.trim_start();
-        if rest.is_empty() {
-            break;
-        }
-        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-        parts.push(&rest[..end]);
-        rest = &rest[end..];
-    }
-    rest = rest.trim_start();
-    if !rest.is_empty() {
-        parts.push(rest);
-    }
-    if parts.len() < 9 {
-        return None;
-    }
-
-    let permissions = parts[0];
-    let is_dir = permissions.starts_with('d');
-    let raw_name = parts[8];
-    let name = listing_name(raw_name);
-    if name.is_empty() || name == "." || name == ".." {
-        return None;
-    }
-    if !show_hidden && name.starts_with('.') {
-        return None;
-    }
-
-    Some(Entry {
-        name: name.to_string(),
-        is_dir,
-        size: (!is_dir).then_some(parse_human_size(parts[4])),
-        modified: parse_ls_date(parts[5], parts[6], parts[7]),
-    })
-}
-
-fn listing_name(raw_name: &str) -> String {
-    let name = raw_name
-        .split_once(" -> ")
-        .map(|(name, _)| name)
-        .unwrap_or(raw_name)
-        .trim();
-    let without_trailing_slash = name.trim_end_matches('/');
-    without_trailing_slash
-        .rsplit('/')
-        .next()
-        .filter(|leaf| !leaf.is_empty())
-        .unwrap_or(without_trailing_slash)
-        .to_string()
-}
-
 pub fn parent_remote_path(path: &str) -> String {
     let trimmed = path.trim();
     if trimmed == "/" {
@@ -276,68 +206,6 @@ fn format_short_date(ts: i64) -> String {
     format!("{} {}", months[month.min(11)], remaining + 1)
 }
 
-fn parse_human_size(value: &str) -> u64 {
-    let value = value.trim();
-    if value.is_empty() {
-        return 0;
-    }
-    let last = value.as_bytes()[value.len() - 1];
-    let multiplier = match last {
-        b'K' => 1024,
-        b'M' => 1024 * 1024,
-        b'G' => 1024 * 1024 * 1024,
-        b'T' => 1024_u64 * 1024 * 1024 * 1024,
-        _ => 1,
-    };
-    let number = if multiplier > 1 {
-        &value[..value.len() - 1]
-    } else {
-        value
-    };
-    (number.parse::<f64>().unwrap_or(0.0) * multiplier as f64) as u64
-}
-
-fn parse_ls_date(month: &str, day: &str, time_or_year: &str) -> Option<i64> {
-    let month = match month {
-        "Jan" => 0,
-        "Feb" => 1,
-        "Mar" => 2,
-        "Apr" => 3,
-        "May" => 4,
-        "Jun" => 5,
-        "Jul" => 6,
-        "Aug" => 7,
-        "Sep" => 8,
-        "Oct" => 9,
-        "Nov" => 10,
-        "Dec" => 11,
-        _ => return None,
-    };
-    let day = day.parse::<i64>().ok()?;
-    if !(1..=31).contains(&day) {
-        return None;
-    }
-
-    if time_or_year.contains(':') {
-        let mut parts = time_or_year.splitn(2, ':');
-        let hour = parts.next()?.parse().ok()?;
-        let minute = parts.next()?.parse().ok()?;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        let mut year = epoch_to_year(now);
-        let candidate = approximate_epoch(year, month, day, hour, minute);
-        if candidate > now + 86400 {
-            year -= 1;
-        }
-        Some(approximate_epoch(year, month, day, hour, minute))
-    } else {
-        let year = time_or_year.parse().ok()?;
-        Some(approximate_epoch(year, month, day, 0, 0))
-    }
-}
-
 fn approximate_epoch(year: i64, month: i64, day: i64, hour: i64, minute: i64) -> i64 {
     let y = year - 1970;
     let mut days = y * 365 + (y + 1) / 4;
@@ -378,41 +246,6 @@ pub fn clean_local_path(path: PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_ls_output_with_spaces_and_hidden_filter() {
-        let output = "\
-total 8
-drwxr-xr-x  2 me staff  64 May 28 10:00 docs
--rw-r--r--  1 me staff 1.5K May 28 10:01 report final.txt
--rw-r--r--  1 me staff    5 May 28 10:02 .secret
-";
-        let entries = parse_ls_output(output, false, SortMode::Name);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].name, "docs");
-        assert_eq!(entries[1].name, "report final.txt");
-        assert_eq!(entries[1].size, Some(1536));
-    }
-
-    #[test]
-    fn parses_sftp_listing_with_absolute_names() {
-        let output = "\
-drwxr-xr-x    ? user group       4096 May 28 10:00 /remote/base/../
-drwxr-xr-x    ? user group       4096 May 28 10:00 /remote/base/./
-drwxr-xr-x    ? user group       4096 May 28 10:00 /remote/base/.cache/
-drwxr-xr-x    ? user group       4096 May 28 10:00 /remote/base/data/
--rw-r--r--    ? user group        128 May 28 10:01 /remote/base/report.txt
-";
-        let entries = parse_ls_output(output, false, SortMode::Name);
-
-        assert_eq!(
-            entries
-                .iter()
-                .map(|entry| entry.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["data", "report.txt"]
-        );
-    }
 
     #[test]
     fn remote_parent_handles_roots_and_relatives() {

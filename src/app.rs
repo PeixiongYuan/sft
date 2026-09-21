@@ -816,6 +816,9 @@ impl App {
                 if self.direct_host {
                     self.should_quit = true;
                 } else {
+                    if let Some(file) = self.file.as_ref() {
+                        remote::close_session(&file.connection);
+                    }
                     self.screen = Screen::Hosts;
                     self.file = None;
                     self.message = None;
@@ -1931,13 +1934,11 @@ impl App {
                 let connection = file.connection.clone();
                 let path = file.remote_path.clone();
                 let count = plan.names.len();
-                let has_dirs = plan.has_dirs;
                 let names = plan.names;
                 file.transferring = Some(format!("deleting {count} item(s)"));
                 thread::spawn(move || {
-                    let result =
-                        remote::delete_remote_entries(&connection, &path, &names, has_dirs)
-                            .map(|()| format!("deleted {count} remote item(s)"));
+                    let result = remote::delete_remote_entries(&connection, &path, &names)
+                        .map(|()| format!("deleted {count} remote item(s)"));
                     let _ = tx.send(AppEvent::FileOperationFinished {
                         operation: FileOperation::Delete,
                         result,

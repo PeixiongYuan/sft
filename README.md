@@ -76,7 +76,8 @@ File transfer:
 
 ## Notes
 
-- Requires `ssh` and `sftp` in `PATH`.
+- Requires `ssh` in `PATH`. Listings, file operations and transfers speak SFTP
+  directly over `ssh -s sftp`, reusing one connection per host.
 
 ## Development
 
