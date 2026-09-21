@@ -43,7 +43,6 @@ const STRIPE_THRESHOLD: u64 = 2 * DOWNLOAD_CHUNK;
 const WRITE_PIPELINE_LIMIT: usize = 4 * 1024 * 1024;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const CHILD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Transfers follow symlinks, so bound directory nesting to catch link loops.
 const MAX_SCAN_DEPTH: u32 = 64;
 /// Give up after this many consecutive attempts without any forward progress.
@@ -229,9 +228,12 @@ async fn attempt_transfer(
         let options = SftpOptions::new().tokio_compat_file_write_limit(
             WRITE_PIPELINE_LIMIT.try_into().expect("nonzero limit"),
         );
-        let sftp = tokio::time::timeout(HANDSHAKE_TIMEOUT, Sftp::new(stdin, stdout, options))
-            .await
-            .map_err(|_| TransferError::retryable("sftp handshake timed out"))?
+        let sftp = tokio::time::timeout(
+            remote::SFTP_HANDSHAKE_TIMEOUT,
+            Sftp::new(stdin, stdout, options),
+        )
+        .await
+        .map_err(|_| TransferError::retryable(remote::handshake_timeout_message()))?
             .map_err(|err| {
                 TransferError::retryable(format!("failed to start sftp session: {err}"))
             })?;
