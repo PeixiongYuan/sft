@@ -276,9 +276,11 @@ async fn read_dir(sftp: &Sftp, path: &str) -> Result<Vec<Entry>, SftpError> {
         // Symlinks report as symlinks, not as their target, matching what
         // the old `ls -l` parsing produced.
         let is_dir = meta.file_type().is_some_and(|kind| kind.is_dir());
+        let is_link = meta.file_type().is_some_and(|kind| kind.is_symlink());
         entries.push(Entry {
             name,
             is_dir,
+            is_link,
             size: (!is_dir).then(|| meta.len().unwrap_or(0)),
             modified: meta.modified().map(|time| i64::from(time.into_raw())),
         });
