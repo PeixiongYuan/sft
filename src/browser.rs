@@ -53,6 +53,8 @@ impl SortMode {
 pub struct Entry {
     pub name: String,
     pub is_dir: bool,
+    /// The entry is a symlink; `is_dir` then describes the local target.
+    pub is_link: bool,
     pub size: Option<u64>,
     pub modified: Option<i64>,
 }
@@ -66,12 +68,20 @@ pub fn list_local(path: &Path, show_hidden: bool, sort: SortMode) -> std::io::Re
             continue;
         }
 
-        let metadata = entry.metadata()?;
+        let is_link = entry.file_type()?.is_symlink();
+        let metadata = if is_link {
+            // Follow links so a link to a directory (such as ~/OneDrive) opens
+            // like one. A dangling link falls back to the link itself.
+            std::fs::metadata(entry.path()).or_else(|_| entry.metadata())?
+        } else {
+            entry.metadata()?
+        };
         let is_dir = metadata.is_dir();
         let modified = metadata.modified().ok().and_then(system_time_to_epoch);
         entries.push(Entry {
             name,
             is_dir,
+            is_link,
             size: (!is_dir).then_some(metadata.len()),
             modified,
         });
@@ -262,12 +272,14 @@ mod tests {
             Entry {
                 name: "Report.txt".to_string(),
                 is_dir: false,
+                is_link: false,
                 size: None,
                 modified: None,
             },
             Entry {
                 name: "src".to_string(),
                 is_dir: true,
+                is_link: false,
                 size: None,
                 modified: None,
             },
@@ -277,5 +289,30 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name, "Report.txt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_listing_follows_directory_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("real")).unwrap();
+        std::fs::write(dir.path().join("note.txt"), "hi").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("dir link")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("note.txt"), dir.path().join("file link"))
+            .unwrap();
+        std::os::unix::fs::symlink(dir.path().join("missing"), dir.path().join("dangling"))
+            .unwrap();
+
+        let entries = list_local(dir.path(), false, SortMode::Name).unwrap();
+        let find = |name: &str| entries.iter().find(|entry| entry.name == name).unwrap();
+
+        assert!(find("dir link").is_dir);
+        assert!(find("dir link").is_link);
+        assert!(!find("file link").is_dir);
+        assert_eq!(find("file link").size, Some(2));
+        assert!(!find("dangling").is_dir);
+        assert!(find("dangling").is_link);
+        assert!(find("real").is_dir);
+        assert!(!find("real").is_link);
     }
 }

@@ -2331,10 +2331,12 @@ fn delete_plan_from_selection_or_current(file: &FileSession) -> Option<DeletePla
         names.sort();
         names
     };
+    // Deleting a link only unlinks it, so links to directories are not
+    // recursive deletes.
     let has_dirs = names.iter().any(|name| {
         all_entries
             .iter()
-            .any(|entry| entry.name == *name && entry.is_dir)
+            .any(|entry| entry.name == *name && entry.is_dir && !entry.is_link)
     });
 
     Some(DeletePlan {
@@ -2516,7 +2518,8 @@ fn complete_local_path(current: &Path, input: &str) -> Option<PathCompletion> {
         .ok()?
         .filter_map(|entry| {
             let entry = entry.ok()?;
-            if !entry.file_type().ok()?.is_dir() {
+            let kind = entry.file_type().ok()?;
+            if !(kind.is_dir() || (kind.is_symlink() && entry.path().is_dir())) {
                 return None;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -2748,12 +2751,14 @@ mod tests {
             Entry {
                 name: "project data".to_string(),
                 is_dir: true,
+                is_link: false,
                 size: None,
                 modified: None,
             },
             Entry {
                 name: "project notes".to_string(),
                 is_dir: true,
+                is_link: false,
                 size: None,
                 modified: None,
             },
@@ -2761,6 +2766,20 @@ mod tests {
         let remote = complete_remote_path("/home/me", "/home/me", &entries, r"project\ d")
             .expect("remote completion");
         assert_eq!(remote.replacement, Some("project data/".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_completion_includes_directory_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("real")).unwrap();
+        std::fs::write(dir.path().join("note.txt"), "hi").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("OneDrive")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("note.txt"), dir.path().join("Onenote"))
+            .unwrap();
+
+        let local = complete_local_path(dir.path(), "One").expect("local completion");
+        assert_eq!(local.replacement, Some("OneDrive/".to_string()));
     }
 
     #[test]
